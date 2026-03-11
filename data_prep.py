@@ -93,9 +93,48 @@ FILE_LABELS = {
 }
 
 # ═══════════════════════════════════════════════════════════
-# ЕДТ УНШИГЧ
+# ЕДТ УНШИГЧ — ЯМАР Ч ФОРМАТ
 # ═══════════════════════════════════════════════════════════
-def process_edt(file_obj, report_year):
+# Баганы нэр таних толь бичиг (монгол + англи)
+COL_PATTERNS = {
+    'account_code': ['дансны код','дансны дугаар','данс код','account code','account no','account number','acc code','acc no','account','данс №','код'],
+    'account_name': ['дансны нэр','данс нэр','account name','acc name','description','нэр'],
+    'transaction_date': ['огноо','date','transaction date','тайлбар огноо','txn date','он сар'],
+    'debit_mnt': ['дебит','debit','dt','дт','debit amount','дебит дүн'],
+    'credit_mnt': ['кредит','credit','ct','кт','credit amount','кредит дүн'],
+    'balance_mnt': ['үлдэгдэл','balance','bal','ending balance','эцсийн үлдэгдэл'],
+    'counterparty_name': ['харилцагч','counterparty','partner','vendor','customer','нэр','cp name','хар нэр'],
+    'transaction_description': ['тайлбар','гүйлгээний утга','утга','description','memo','narration','reference'],
+    'journal_no': ['журнал','journal','journal no','jnl'],
+    'document_no': ['баримт','document','doc no','баримтын дугаар'],
+}
+
+def match_column(header, target_field):
+    """Баганы гарчиг нь тухайн талбарт тохирох эсэхийг шалгана."""
+    h = str(header).lower().strip()
+    for pattern in COL_PATTERNS.get(target_field, []):
+        if pattern in h:
+            return True
+    return False
+
+def auto_map_columns(headers):
+    """Баганы гарчигуудаас автоматаар талбар руу нь зурагж (map) өгнө."""
+    mapping = {}
+    used = set()
+    # Эрэмбэлэлт: account_code, debit, credit зэргийг эхэлж олох
+    priority = ['account_code','debit_mnt','credit_mnt','transaction_date','account_name',
+                'counterparty_name','transaction_description','balance_mnt','journal_no','document_no']
+    for field in priority:
+        for i, h in enumerate(headers):
+            if i in used: continue
+            if match_column(h, field):
+                mapping[field] = i
+                used.add(i)
+                break
+    return mapping
+
+def process_edt_structured(file_obj, report_year):
+    """Стандарт ЕДТ формат: Данс: [xxx-xx-xx-xxx] бүтэцтэй."""
     import openpyxl
     wb = openpyxl.load_workbook(file_obj, read_only=True)
     ws = wb[wb.sheetnames[0]]
@@ -126,8 +165,134 @@ def process_edt(file_obj, report_year):
             'balance_mnt':safe_float(row[13]) if len(row)>13 else 0.0,
             'month':tx_date[:7] if len(tx_date)>=7 else ''})
     wb.close()
-    if not rows_out: return pd.DataFrame(columns=EDT_COLUMNS), 0
-    return pd.DataFrame(rows_out), len(rows_out)
+    return rows_out
+
+def process_edt_tabular(file_obj, report_year):
+    """Хүснэгт формат: Баганы гарчигтай энгийн Excel."""
+    import openpyxl
+    raw = file_obj.read(); file_obj.seek(0)
+    wb = openpyxl.load_workbook(io.BytesIO(raw), read_only=True)
+    ws = wb[wb.sheetnames[0]]
+
+    # Эхний 20 мөрөөс гарчиг хайх
+    all_rows = []
+    for i, row in enumerate(ws.iter_rows(values_only=True)):
+        all_rows.append(list(row))
+        if i >= 500: break
+    wb.close()
+
+    # Гарчиг мөрийг олох (хамгийн олон баганы нэр таарсан мөр)
+    best_header_idx = 0
+    best_score = 0
+    for i, row in enumerate(all_rows[:20]):
+        score = 0
+        for cell in row:
+            if cell is None: continue
+            h = str(cell).lower().strip()
+            for patterns in COL_PATTERNS.values():
+                if any(p in h for p in patterns):
+                    score += 1
+                    break
+        if score > best_score:
+            best_score = score
+            best_header_idx = i
+
+    if best_score < 2:
+        return []  # Гарчиг олдсонгүй
+
+    headers = [str(c).strip() if c else f'col_{j}' for j, c in enumerate(all_rows[best_header_idx])]
+    col_map = auto_map_columns(headers)
+
+    if 'account_code' not in col_map and 'debit_mnt' not in col_map:
+        return []  # Шаардлагатай баганууд олдсонгүй
+
+    rows_out = []
+    def _get_val(row, col_map, field, default=''):
+        idx = col_map.get(field)
+        if idx is None or idx >= len(row): return default
+        v = row[idx]
+        return str(v).strip() if v is not None else default
+
+    for row in all_rows[best_header_idx+1:]:
+        # Хоосон мөр алгасах
+        if all(c is None for c in row): continue
+
+        acct_code = _get_val(row, col_map, 'account_code')
+        if not acct_code or acct_code in ('None','nan',''): continue
+
+        debit = safe_float(row[col_map['debit_mnt']]) if 'debit_mnt' in col_map and col_map['debit_mnt'] < len(row) else 0.0
+        credit = safe_float(row[col_map['credit_mnt']]) if 'credit_mnt' in col_map and col_map['credit_mnt'] < len(row) else 0.0
+        if debit == 0 and credit == 0: continue
+
+        td_raw = _get_val(row, col_map, 'transaction_date')
+        tx_date = ''
+        if td_raw:
+            idx = col_map.get('transaction_date')
+            if idx is not None and idx < len(row) and isinstance(row[idx], datetime):
+                tx_date = row[idx].strftime('%Y-%m-%d')
+            else:
+                tx_date = td_raw[:10] if len(td_raw) >= 10 else td_raw
+
+        rows_out.append({
+            'report_year': str(report_year),
+            'account_code': acct_code,
+            'account_name': _get_val(row, col_map, 'account_name'),
+            'transaction_no': str(len(rows_out)+1),
+            'transaction_date': tx_date,
+            'journal_no': _get_val(row, col_map, 'journal_no'),
+            'document_no': _get_val(row, col_map, 'document_no'),
+            'counterparty_name': _get_val(row, col_map, 'counterparty_name'),
+            'counterparty_id': '',
+            'transaction_description': _get_val(row, col_map, 'transaction_description'),
+            'debit_mnt': debit,
+            'credit_mnt': credit,
+            'balance_mnt': safe_float(row[col_map['balance_mnt']]) if 'balance_mnt' in col_map and col_map['balance_mnt'] < len(row) else 0.0,
+            'month': tx_date[:7] if len(tx_date) >= 7 else '',
+        })
+    return rows_out
+
+def process_edt(file_obj, report_year):
+    """Ямар ч форматын ЕДТ/Ерөнхий журнал уншина.
+    1) Стандарт ЕДТ формат (Данс: [...]) оролдоно
+    2) Амжилтгүй бол хүснэгт форматаар уншина
+    """
+    file_obj.seek(0)
+    # 1-р оролдлого: Стандарт ЕДТ формат
+    rows = process_edt_structured(file_obj, report_year)
+    if rows:
+        return pd.DataFrame(rows), len(rows)
+
+    # 2-р оролдлого: Хүснэгт формат (баганы гарчигтай)
+    file_obj.seek(0)
+    rows = process_edt_tabular(file_obj, report_year)
+    if rows:
+        return pd.DataFrame(rows), len(rows)
+
+    # 3-р оролдлого: pandas-аар шууд уншиж баганы нэрээр таних
+    file_obj.seek(0)
+    try:
+        df = pd.read_excel(file_obj)
+        col_map = auto_map_columns(df.columns.tolist())
+        if 'debit_mnt' in col_map or 'credit_mnt' in col_map:
+            rename = {}
+            for field, idx in col_map.items():
+                rename[df.columns[idx]] = field
+            df = df.rename(columns=rename)
+            df['report_year'] = str(report_year)
+            for c in EDT_COLUMNS:
+                if c not in df.columns:
+                    df[c] = '' if c in ('account_code','account_name','transaction_description','counterparty_name') else 0
+            df['debit_mnt'] = pd.to_numeric(df.get('debit_mnt',0), errors='coerce').fillna(0)
+            df['credit_mnt'] = pd.to_numeric(df.get('credit_mnt',0), errors='coerce').fillna(0)
+            df = df[(df['debit_mnt']!=0)|(df['credit_mnt']!=0)]
+            if 'transaction_date' in df.columns:
+                df['month'] = df['transaction_date'].astype(str).str[:7]
+            else:
+                df['month'] = ''
+            return df[EDT_COLUMNS], len(df)
+    except: pass
+
+    return pd.DataFrame(columns=EDT_COLUMNS), 0
 
 def read_ledger(f):
     raw = f.read(); f.seek(0)
@@ -391,12 +556,22 @@ if uploaded:
         st.markdown(f"### 📊 Нийт: **{len(txn):,}** гүйлгээ, **{txn['account_code'].nunique():,}** данс")
 
         # ── Тохиргоо ──
+        st.markdown("""
+        <div style="background:#F5F5F5; padding:12px; border-radius:8px; margin-bottom:10px;">
+        <b>⚙️ Шинжилгээний тохиргоо</b> — параметрүүдийг өөрчилж илрүүлэлтийн мэдрэмжийг тохируулна
+        </div>
+        """, unsafe_allow_html=True)
         c1, c2 = st.columns(2)
         with c1:
-            cont = st.slider("Хэвийн бус гүйлгээний хувь (%)", 1, 20, 5, 1) / 100
+            cont = st.slider("🎯 IF contamination — Хэвийн бус гүйлгээний хувь (%)", 1, 20, 5, 1,
+                help="Isolation Forest (Тусгаарлалтын ой) алгоритм нийт гүйлгээний хэдэн хувийг хэвийн бус гэж үзэх. "
+                     "5% = зөвхөн хамгийн сэжигтэй 5%-ийг илрүүлнэ. "
+                     "20% = илүү олон гүйлгээг шалгана (илүү өргөн хүрээ).") / 100
         with c2:
-            max_rows = st.selectbox("Шинжлэх гүйлгээний хязгаар", [50000, 100000, 500000, 1000000, len(txn)],
-                format_func=lambda x: f"{x:,}" if x < len(txn) else f"Бүгд ({len(txn):,})")
+            max_rows = st.selectbox("📊 Шинжлэх гүйлгээний хязгаар", [50000, 100000, 500000, 1000000, len(txn)],
+                format_func=lambda x: f"{x:,}" if x < len(txn) else f"Бүгд ({len(txn):,})",
+                help="Том файлын хувьд бүх гүйлгээг шинжлэхэд удаан байж болно. "
+                     "Түүвэрлэлт хийвэл хурдан шинжлэнэ, гэхдээ бүх гүйлгээг хамрахгүй.")
 
         if st.button("🚀 Гүйлгээний эрсдэл илрүүлэх", type="primary", use_container_width=True):
             # Хэрэв хэт олон мөр бол түүвэрлэнэ
