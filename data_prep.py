@@ -305,8 +305,17 @@ def read_ledger(f):
 def engineer_transaction_features(df):
     """ЕДТ гүйлгээ бүрээс шинж чанарууд үүсгэнэ."""
     d = df.copy()
+    # Дутуу баганууд нэмэх
+    for c in ['debit_mnt','credit_mnt','account_code','account_name','counterparty_name','transaction_description','transaction_date']:
+        if c not in d.columns:
+            d[c] = '' if c in ('account_code','account_name','counterparty_name','transaction_description','transaction_date') else 0
     d['debit_mnt'] = pd.to_numeric(d['debit_mnt'], errors='coerce').fillna(0)
     d['credit_mnt'] = pd.to_numeric(d['credit_mnt'], errors='coerce').fillna(0)
+    d['account_code'] = d['account_code'].astype(str).fillna('000')
+    d['account_name'] = d['account_name'].astype(str).fillna('')
+    d['counterparty_name'] = d['counterparty_name'].astype(str).fillna('')
+    d['transaction_description'] = d['transaction_description'].astype(str).fillna('')
+    d['transaction_date'] = d['transaction_date'].astype(str).fillna('')
 
     # 1. Гүйлгээний дүн
     d['amount'] = d['debit_mnt'].abs() + d['credit_mnt'].abs()
@@ -359,88 +368,60 @@ def engineer_transaction_features(df):
     # ═══════════════════════════════════════════════════════
     # 11. ГҮЙЛГЭЭНИЙ ТАЙЛБАР ↔ ДАНСНЫ НЭР ТУЛГАЛТ
     # ═══════════════════════════════════════════════════════
-    desc = d['transaction_description'].fillna('').str.lower().str.strip()
-    acct_name = d['account_name'].fillna('').str.lower().str.strip()
-
-    # 11a. Дансны нэрийн түлхүүр үгс гүйлгээний тайлбарт байгаа эсэх
-    def extract_keywords(text):
-        """Текстээс 3+ тэмдэгтийн үгсийг ялгана."""
-        if not text: return set()
-        words = re.findall(r'[а-яөүё\w]{3,}', text)
-        # Хэт нийтлэг үгсийг хасах
-        stop = {'дансны','данс','нийт','бусад','зардал','орлого','төлбөр','хөрөнгө',
-                'тооцоо','тооцооны','бүртгэл','дүн','төгрөг','сая','мянга','нэг',
-                'хоёр','гурав','дөрөв','тав','зургаа','долоо','найм','ес','арав',
-                'оны','онд','сарын','сард','өдрийн','журнал','гүйлгээ','баримт'}
-        return set(w for w in words if w not in stop and len(w) >= 3)
-
-    # Данс бүрийн ердийн тайлбарын түлхүүр үгсийн багц үүсгэх
-    acct_typical_words = {}
-    for code in d['account_code'].unique():
-        mask = d['account_code'] == code
-        all_descs = ' '.join(d.loc[mask, 'transaction_description'].fillna('').str.lower())
-        words = re.findall(r'[а-яөүё\w]{3,}', all_descs)
-        if words:
-            word_counts = Counter(words)
-            # Тухайн дансанд 3+ удаа гарсан үгсийг "ердийн" гэж үзнэ
-            acct_typical_words[code] = set(w for w, c in word_counts.items() if c >= 3 and len(w) >= 3)
-        else:
-            acct_typical_words[code] = set()
-
-    # 11b. Гүйлгээний тайлбар нь тухайн дансны ердийн тайлбараас хэр зөрсөн
-    def desc_mismatch_score(row):
-        code = row['account_code']
-        tx_desc = str(row['transaction_description']).lower() if row['transaction_description'] else ''
-        if not tx_desc or code not in acct_typical_words: return 0
-        typical = acct_typical_words[code]
-        if not typical: return 0
-        tx_words = set(re.findall(r'[а-яөүё\w]{3,}', tx_desc))
-        if not tx_words: return 1  # Бүрэн хоосон тайлбар
-        overlap = len(tx_words & typical)
-        # Ердийн үгсийн аль нэг нь ч байхгүй бол зөрчилтэй
-        return 0 if overlap > 0 else 1
-
-    d['desc_acct_mismatch'] = d.apply(desc_mismatch_score, axis=1)
-
-    # 11c. Дансны нэрийн гол үг ↔ гүйлгээний тайлбарын тулгалт
-    def name_desc_overlap(row):
-        aname = str(row['account_name']).lower() if row['account_name'] else ''
-        tdesc = str(row['transaction_description']).lower() if row['transaction_description'] else ''
-        if not aname or not tdesc: return 0
-        name_kw = extract_keywords(aname)
-        desc_kw = extract_keywords(tdesc)
-        if not name_kw or not desc_kw: return 0
-        overlap = len(name_kw & desc_kw)
-        return overlap / max(len(name_kw), 1)
-    d['name_desc_overlap'] = d.apply(name_desc_overlap, axis=1)
-    d['name_desc_no_overlap'] = (d['name_desc_overlap'] == 0).astype(int)
-
-    # 11d. Тухайн данснаас ер бусын тайлбартай гүйлгээ (данс доторх ховор тайлбар)
-    def desc_rarity_in_account(row):
-        code = row['account_code']
-        tdesc = str(row['transaction_description']).lower() if row['transaction_description'] else ''
-        if not tdesc or code not in acct_typical_words: return 0
-        typical = acct_typical_words[code]
-        if not typical: return 0
-        tx_words = set(re.findall(r'[а-яөүё\w]{3,}', tdesc))
-        if not tx_words: return 0
-        # Тухайн дансны ердийн биш үгсийн хувь
-        unusual = len(tx_words - typical)
-        return unusual / max(len(tx_words), 1)
-    d['desc_unusual_ratio'] = d.apply(desc_rarity_in_account, axis=1)
-
-    # 11e. Дансны төрөл ↔ гүйлгээний чиглэл зөрчил
-    # Жишээ: Орлогын данс (5xx) → дебит гүйлгээ = сэжигтэй
-    acct_first = d['account_code'].astype(str).str[0]
+    d['desc_acct_mismatch'] = 0
+    d['name_desc_overlap'] = 0.0
+    d['name_desc_no_overlap'] = 0
+    d['desc_unusual_ratio'] = 0.0
     d['acct_direction_mismatch'] = 0
-    # Хөрөнгийн данс (1xx) → ихэвчлэн дебит. Кредит = хэвийн бус байж болно
-    d.loc[(acct_first=='1') & (d['credit_mnt']>0) & (d['debit_mnt']==0), 'acct_direction_mismatch'] = 1
-    # Өр төлбөрийн данс (2xx) → ихэвчлэн кредит. Дебит = буцаалт эсвэл хэвийн бус
-    d.loc[(acct_first=='2') & (d['debit_mnt']>0) & (d['credit_mnt']==0), 'acct_direction_mismatch'] = 1
-    # Орлогын данс (5xx) → ихэвчлэн кредит. Дебит = буцаалт эсвэл залруулга
-    d.loc[(acct_first=='5') & (d['debit_mnt']>0) & (d['credit_mnt']==0), 'acct_direction_mismatch'] = 1
-    # Зардлын данс (6-8xx) → ихэвчлэн дебит. Кредит = буцаалт эсвэл залруулга
-    d.loc[(acct_first.isin(['6','7','8'])) & (d['credit_mnt']>0) & (d['debit_mnt']==0), 'acct_direction_mismatch'] = 1
+    try:
+        desc = d['transaction_description'].str.lower().str.strip()
+        acct_name = d['account_name'].str.lower().str.strip()
+
+        def extract_keywords(text):
+            if not text: return set()
+            words = re.findall(r'[а-яөүё\w]{3,}', text)
+            stop = {'дансны','данс','нийт','бусад','зардал','орлого','төлбөр','хөрөнгө',
+                    'тооцоо','тооцооны','бүртгэл','дүн','төгрөг','сая','мянга','нэг',
+                    'хоёр','гурав','дөрөв','тав','зургаа','долоо','найм','ес','арав',
+                    'оны','онд','сарын','сард','өдрийн','журнал','гүйлгээ','баримт'}
+            return set(w for w in words if w not in stop and len(w) >= 3)
+
+        acct_typical_words = {}
+        for code in d['account_code'].unique():
+            all_descs = ' '.join(d.loc[d['account_code']==code, 'transaction_description'].str.lower())
+            wc = Counter(re.findall(r'[а-яөүё\w]{3,}', all_descs))
+            acct_typical_words[code] = set(w for w, c in wc.items() if c >= 3 and len(w) >= 3)
+
+        def _desc_mismatch(code, tx_desc):
+            tx = str(tx_desc).lower() if tx_desc else ''
+            if not tx or code not in acct_typical_words or not acct_typical_words[code]: return 0
+            return 0 if len(set(re.findall(r'[а-яөүё\w]{3,}', tx)) & acct_typical_words[code]) > 0 else 1
+        d['desc_acct_mismatch'] = [_desc_mismatch(c, t) for c, t in zip(d['account_code'], d['transaction_description'])]
+
+        def _name_overlap(aname, tdesc):
+            a, t = str(aname).lower() if aname else '', str(tdesc).lower() if tdesc else ''
+            if not a or not t: return 0
+            nk, dk = extract_keywords(a), extract_keywords(t)
+            if not nk or not dk: return 0
+            return len(nk & dk) / max(len(nk), 1)
+        d['name_desc_overlap'] = [_name_overlap(a, t) for a, t in zip(d['account_name'], d['transaction_description'])]
+        d['name_desc_no_overlap'] = (d['name_desc_overlap'] == 0).astype(int)
+
+        def _desc_rarity(code, tdesc):
+            tx = str(tdesc).lower() if tdesc else ''
+            if not tx or code not in acct_typical_words or not acct_typical_words[code]: return 0
+            tx_words = set(re.findall(r'[а-яөүё\w]{3,}', tx))
+            if not tx_words: return 0
+            return len(tx_words - acct_typical_words[code]) / max(len(tx_words), 1)
+        d['desc_unusual_ratio'] = [_desc_rarity(c, t) for c, t in zip(d['account_code'], d['transaction_description'])]
+
+        acct_first = d['account_code'].str[0]
+        d.loc[(acct_first=='1') & (d['credit_mnt']>0) & (d['debit_mnt']==0), 'acct_direction_mismatch'] = 1
+        d.loc[(acct_first=='2') & (d['debit_mnt']>0) & (d['credit_mnt']==0), 'acct_direction_mismatch'] = 1
+        d.loc[(acct_first=='5') & (d['debit_mnt']>0) & (d['credit_mnt']==0), 'acct_direction_mismatch'] = 1
+        d.loc[(acct_first.isin(['6','7','8'])) & (d['credit_mnt']>0) & (d['debit_mnt']==0), 'acct_direction_mismatch'] = 1
+    except Exception:
+        pass
 
     # 9. Цаг хугацааны шинж
     d['day'] = pd.to_numeric(d['transaction_date'].str[8:10], errors='coerce').fillna(15)
@@ -465,12 +446,16 @@ def run_transaction_anomaly(df, contamination=0.05):
                 'amount_zscore','cp_is_rare','pair_is_rare','desc_empty',
                 'is_month_end','is_year_end','is_duplicate','is_debit',
                 'desc_acct_mismatch','name_desc_no_overlap','desc_unusual_ratio','acct_direction_mismatch']
+    # Дутуу feature нэмэх
+    for f in features:
+        if f not in df.columns:
+            df[f] = 0
 
-    X = df[features].fillna(0).replace([np.inf, -np.inf], 0)
+    X = df[features].fillna(0).replace([np.inf, -np.inf], 0).astype(float)
 
     # Isolation Forest
-    iso = IsolationForest(contamination=contamination, random_state=42, n_estimators=200, n_jobs=-1)
-    df['anomaly_score'] = iso.decision_function(X)
+    iso = IsolationForest(contamination=contamination, random_state=42, n_estimators=200, n_jobs=1)
+    df['anomaly_score'] = -iso.fit(X).score_samples(X)
     df['is_anomaly'] = (iso.predict(X) == -1).astype(int)
 
     # Z-score нэмэлт шалгалт
@@ -634,10 +619,17 @@ if uploaded:
         # ── TAB 2: Хэвийн бус гүйлгээний жагсаалт ──
         with tabs[1]:
             st.subheader("🔴 Хэвийн бус гүйлгээний жагсаалт")
-            risk_filter = st.selectbox("Эрсдэлийн түвшин:", ['Бүгд','🔴 Маш өндөр','🟠 Өндөр','🟡 Дунд'])
+            dp_years = sorted(result['report_year'].dropna().unique().tolist()) if 'report_year' in result.columns else []
+            fc1, fc2 = st.columns(2)
+            with fc1:
+                risk_filter = st.selectbox("Эрсдэлийн түвшин:", ['Бүгд','🔴 Маш өндөр','🟠 Өндөр','🟡 Дунд'], key='dp_risk_f')
+            with fc2:
+                year_filter = st.selectbox("Он:", ['Бүгд'] + [str(y) for y in dp_years], key='dp_year_f')
             anom = result[result['is_anomaly']==1].copy()
             if risk_filter != 'Бүгд':
                 anom = anom[anom['risk_level']==risk_filter]
+            if year_filter != 'Бүгд' and 'report_year' in anom.columns:
+                anom = anom[anom['report_year'].astype(str)==year_filter]
             show_cols = ['risk_level','risk_score','account_code','account_name','counterparty_name',
                          'transaction_date','debit_mnt','credit_mnt','transaction_description',
                          'amount_zscore','is_duplicate','cp_is_rare',
@@ -650,7 +642,12 @@ if uploaded:
         # ── TAB 3: Дансаар нэгтгэл ──
         with tabs[2]:
             st.subheader("🏷️ Дансаар нэгтгэсэн эрсдэлийн тойм")
-            acct_risk = result.groupby(['account_code','account_name']).agg(
+            dp_years3 = sorted(result['report_year'].dropna().unique().tolist()) if 'report_year' in result.columns else []
+            year_f3 = st.selectbox("Он:", ['Бүгд'] + [str(y) for y in dp_years3], key='dp_acct_year')
+            res_f3 = result.copy()
+            if year_f3 != 'Бүгд' and 'report_year' in res_f3.columns:
+                res_f3 = res_f3[res_f3['report_year'].astype(str)==year_f3]
+            acct_risk = res_f3.groupby(['account_code','account_name']).agg(
                 total_txn=('amount','count'), anomaly_txn=('is_anomaly','sum'),
                 total_amount=('amount','sum'), avg_risk=('risk_score','mean'),
                 max_risk=('risk_score','max')
@@ -659,18 +656,24 @@ if uploaded:
             acct_risk = acct_risk.sort_values('anomaly_txn', ascending=False)
             st.write(f"Нийт: **{len(acct_risk):,}** данс")
             st.dataframe(acct_risk.head(50), use_container_width=True, hide_index=True)
-            # Топ 20 аномали данс
+            st.download_button("📥 Дансны жагсаалт CSV", acct_risk.to_csv(index=False).encode('utf-8-sig'), "account_risk.csv", key='dp_dl_acct')
             top20 = acct_risk.head(20)
-            fig_a = px.bar(top20, x='anomaly_txn', y='account_name', orientation='h',
-                color='avg_risk', color_continuous_scale='Reds',
-                title='Топ 20 — хэвийн бус гүйлгээ хамгийн олонтой данс',
-                labels={'anomaly_txn':'Хэвийн бус гүйлгээний тоо','account_name':'Данс','avg_risk':'Дундаж эрсдэл'})
-            fig_a.update_layout(height=500, yaxis={'categoryorder':'total ascending'}); st.plotly_chart(fig_a, use_container_width=True)
+            if len(top20) > 0:
+                fig_a = px.bar(top20, x='anomaly_txn', y='account_name', orientation='h',
+                    color='avg_risk', color_continuous_scale='Reds',
+                    title='Топ 20 — хэвийн бус гүйлгээ хамгийн олонтой данс',
+                    labels={'anomaly_txn':'Хэвийн бус гүйлгээний тоо','account_name':'Данс','avg_risk':'Дундаж эрсдэл'})
+                fig_a.update_layout(height=500, yaxis={'categoryorder':'total ascending'}); st.plotly_chart(fig_a, use_container_width=True)
 
         # ── TAB 4: Харилцагчаар ──
         with tabs[3]:
             st.subheader("👤 Харилцагчаар нэгтгэсэн эрсдэлийн тойм")
-            cp_risk = result[result['counterparty_name']!=''].groupby('counterparty_name').agg(
+            dp_years4 = sorted(result['report_year'].dropna().unique().tolist()) if 'report_year' in result.columns else []
+            year_f4 = st.selectbox("Он:", ['Бүгд'] + [str(y) for y in dp_years4], key='dp_cp_year')
+            res_f4 = result.copy()
+            if year_f4 != 'Бүгд' and 'report_year' in res_f4.columns:
+                res_f4 = res_f4[res_f4['report_year'].astype(str)==year_f4]
+            cp_risk = res_f4[res_f4['counterparty_name']!=''].groupby('counterparty_name').agg(
                 total_txn=('amount','count'), anomaly_txn=('is_anomaly','sum'),
                 total_amount=('amount','sum'), accounts_used=('account_code','nunique'),
                 avg_risk=('risk_score','mean')
@@ -679,13 +682,14 @@ if uploaded:
             cp_risk = cp_risk.sort_values('anomaly_txn', ascending=False)
             st.write(f"Нийт: **{len(cp_risk):,}** харилцагч")
             st.dataframe(cp_risk.head(50), use_container_width=True, hide_index=True)
-            # Топ 20
+            st.download_button("📥 Харилцагчийн жагсаалт CSV", cp_risk.to_csv(index=False).encode('utf-8-sig'), "counterparty_risk.csv", key='dp_dl_cp')
             top20_cp = cp_risk.head(20)
-            fig_cp = px.bar(top20_cp, x='anomaly_txn', y='counterparty_name', orientation='h',
-                color='accounts_used', color_continuous_scale='Blues',
-                title='Топ 20 — хэвийн бус гүйлгээтэй харилцагч',
-                labels={'anomaly_txn':'Хэвийн бус','counterparty_name':'Харилцагч','accounts_used':'Ашигласан дансны тоо'})
-            fig_cp.update_layout(height=500, yaxis={'categoryorder':'total ascending'}); st.plotly_chart(fig_cp, use_container_width=True)
+            if len(top20_cp) > 0:
+                fig_cp = px.bar(top20_cp, x='anomaly_txn', y='counterparty_name', orientation='h',
+                    color='accounts_used', color_continuous_scale='Blues',
+                    title='Топ 20 — хэвийн бус гүйлгээтэй харилцагч',
+                    labels={'anomaly_txn':'Хэвийн бус','counterparty_name':'Харилцагч','accounts_used':'Ашигласан дансны тоо'})
+                fig_cp.update_layout(height=500, yaxis={'categoryorder':'total ascending'}); st.plotly_chart(fig_cp, use_container_width=True)
 
         # ── TAB 5: Шинж чанарын шинжилгээ ──
         with tabs[4]:
