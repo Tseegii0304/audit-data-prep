@@ -20,6 +20,7 @@ from sklearn.model_selection import StratifiedKFold, cross_val_predict
 from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_score, roc_curve
 import warnings, io, re, gzip, zipfile
 from datetime import datetime
+from pathlib import Path
 from collections import Counter
 warnings.filterwarnings('ignore')
 from tab_descriptions import TabDescriptions
@@ -1469,532 +1470,528 @@ def build_materiality_by_account(tb_df, overall_materiality, performance_ratio=0
     return out.sort_values('Зөвшөөрөгдөх алдаа ₮', ascending=False).reset_index(drop=True)
 
 
+
 FILE_TYPE_LABELS = {
     'raw_tb': ('📗 ГҮЙЛГЭЭ_БАЛАНС', 'Гүйлгээ-балансын түүхий файл → TB болгон хөрвүүлнэ'),
-    'edt': ('📘 Ерөнхий журнал (ЕЖ)', 'Ерөнхий журналын гүйлгээ → Стандарт формат руу хөрвүүлнэ'),
-    'tb_std': ('📊 TB_standardized', 'Стандартчилсан гүйлгээ-баланс → Шинжилгээнд бэлэн'),
-    'ledger': ('📄 Гүйлгээний файл (CSV/GZ)', 'Гүйлгээний дэлгэрэнгүй файл → Шинжилгээнд бэлэн'),
-    'part1': ('📈 Нэгтгэл файл', 'Сарын нэгтгэл + Эрсдэлийн матриц → Шинжилгээнд бэлэн'),
+    'edt': ('📘 Ерөнхий журнал (ЕЖ)', 'Ерөнхий журналын гүйлгээ → стандарт CSV ledger болгон хөрвүүлнэ'),
+    'tb_std': ('📊 TB_standardized', 'Стандартчилсан TB → шинжилгээнд бэлэн'),
+    'ledger': ('📄 Ledger / CSV', 'Гүйлгээний дэлгэрэнгүй файл → journal шинжилгээнд бэлэн'),
+    'part1': ('📈 Part1', 'Сарын нэгтгэл + Эрсдэлийн матриц → TB шинжилгээнд бэлэн'),
     'unknown': ('❓ Тодорхойгүй', 'Файлын төрлийг таних боломжгүй'),
 }
-if page.startswith("1"):
-    st.header("1️⃣ Өгөгдөл оруулах, хөрвүүлэх")
-    st.markdown("""
-    <div style="background-color: #E3F2FD; padding: 15px; border-radius: 8px; border-left: 4px solid #1565C0; margin-bottom: 15px;">
-        <b>📂 Ямар ч файлыг оруулаарай!</b> Систем автоматаар таниж, зөв формат руу хөрвүүлнэ.<br>
-        <span style="color: #555; font-size: 13px;">
-        Дэмжих файлууд: Гүйлгээ баланс (.xlsx), Ерөнхий журнал (.xlsx) — хэдэн ч файл, ямар ч дараалал
-        </span>
-    </div>
-    """, unsafe_allow_html=True)
 
-    uploaded = st.file_uploader("📎 Бүх файлуудаа энд оруулна уу", type=['xlsx', 'csv', 'gz'], accept_multiple_files=True, key='smart_prep')
+for _k, _v in {
+    'prepared_tb_cache': {},
+    'prepared_part1_cache': {},
+    'prepared_ledger_cache': {},
+    'prep_detected_rows': [],
+    'tb_error': '',
+    'journal_error': '',
+}.items():
+    if _k not in st.session_state:
+        st.session_state[_k] = _v
 
-    # ── Дансны нэрийн лавлах файл ──
-    with st.expander("📋 Дансны нэрийн лавлах файл (заавал биш)", expanded=False):
-        st.markdown("Ерөнхий журналд дансны нэр байхгүй тохиолдолд **Санхүүгийн байдлын тайлан (СТ-1А)** эсвэл **Дансны жагсаалт** файлаас нэрийг нэгтгэнэ.")
-        acct_name_file = st.file_uploader("📎 Дансны код + нэрийн файл", type=['xlsx'], key='acct_names_prep')
-        acct_name_map = {}
-        if acct_name_file:
-            acct_name_map = parse_account_names(acct_name_file)
-            if acct_name_map:
-                st.success(f"✅ {len(acct_name_map)} дансны нэр уншигдлаа")
-            else:
-                st.warning("⚠️ Дансны нэр уншигдсангүй. A баганад код, B баганад нэр байх ёстой.")
 
-    if uploaded:
-        detected = []
-        for f in uploaded:
+def _cache_add(cache_key, filename, raw_bytes):
+    st.session_state[cache_key][filename] = raw_bytes
+
+
+def _cache_files(cache_key):
+    out = []
+    for name, raw in st.session_state.get(cache_key, {}).items():
+        bio = io.BytesIO(raw)
+        bio.name = name
+        out.append(bio)
+    return out
+
+
+def _df_to_csv_bytes(df):
+    return df.to_csv(index=False).encode('utf-8-sig')
+
+
+def _df_to_excel_bytes(df_map):
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine='openpyxl') as w:
+        for sname, df in df_map.items():
+            df.to_excel(w, sheet_name=sname[:31], index=False)
+    return buf.getvalue()
+
+
+def _prepare_from_uploaded(uploaded, acct_name_map=None):
+    detected_rows = []
+    acct_name_map = acct_name_map or {}
+    for f in uploaded or []:
+        try:
             ftype, year = detect_file_type(f)
             f.seek(0)
-            detected.append({'file': f, 'type': ftype, 'year': year, 'name': f.name})
+            label, desc = FILE_TYPE_LABELS.get(ftype, FILE_TYPE_LABELS['unknown'])
+            detected_rows.append({'Файл': f.name, 'Төрөл': label, 'Он': year, 'Тайлбар': desc})
+            if ftype == 'raw_tb':
+                buf, tb_sum = process_raw_tb(f)
+                if tb_sum is not None and not tb_sum.empty:
+                    _cache_add('prepared_tb_cache', f'TB_standardized_{year}.xlsx', buf.getvalue())
+            elif ftype == 'tb_std':
+                _cache_add('prepared_tb_cache', f.name, f.getvalue())
+            elif ftype == 'part1':
+                _cache_add('prepared_part1_cache', f.name, f.getvalue())
+            elif ftype == 'ledger':
+                _cache_add('prepared_ledger_cache', f.name, f.getvalue())
+                try:
+                    f.seek(0)
+                    led_df = read_ledger(f)
+                    if not led_df.empty:
+                        _, _, _, rm, _ = generate_part1(led_df, year)
+                        mo = pd.read_excel(io.BytesIO(_df_to_excel_bytes({'tmp': rm})), sheet_name='tmp') if False else None
+                except Exception:
+                    pass
+            elif ftype == 'edt':
+                f.seek(0)
+                edt_df, cnt = process_edt(f, year)
+                if acct_name_map and not edt_df.empty:
+                    edt_df = merge_account_names(edt_df, acct_name_map)
+                if cnt > 0 and not edt_df.empty:
+                    csv_name = f'ledger_from_EJ_{year}_{Path(f.name).stem}.csv'
+                    _cache_add('prepared_ledger_cache', csv_name, _df_to_csv_bytes(edt_df))
+        except Exception as e:
+            detected_rows.append({'Файл': f.name, 'Төрөл': '❌ Алдаа', 'Он': '', 'Тайлбар': str(e)})
+    st.session_state['prep_detected_rows'] = detected_rows
 
-        st.markdown("### 🔍 Таних үр дүн")
-        det_rows = []
-        for d in detected:
-            label, desc = FILE_TYPE_LABELS.get(d['type'], FILE_TYPE_LABELS['unknown'])
-            det_rows.append({'Файл': d['name'], 'Төрөл': label, 'Он': d['year'], 'Тайлбар': desc})
-        st.dataframe(pd.DataFrame(det_rows), use_container_width=True, hide_index=True)
 
-        raw_tbs = [d for d in detected if d['type'] == 'raw_tb']
-        edts = [d for d in detected if d['type'] == 'edt']
-        unknowns = [d for d in detected if d['type'] == 'unknown']
-        ready = [d for d in detected if d['type'] in ('tb_std', 'ledger', 'part1')]
-
-        if unknowns:
-            st.warning(f"⚠️ {len(unknowns)} файл танигдсангүй: {', '.join(u['name'] for u in unknowns)}")
-        if ready:
-            st.success(f"✅ Шинжилгээнд бэлэн: {len(ready)} файл → **2️⃣ Шинжилгээ** руу шилжээрэй")
-
-        if raw_tbs or edts:
-            if st.button("⚙️ Хөрвүүлэлт эхлүүлэх", type="primary", use_container_width=True, key='btn_smart'):
-                if raw_tbs:
-                    if 'tb_res' not in st.session_state:
-                        st.session_state.tb_res = {}
-                    for d in raw_tbs:
-                        with st.spinner(f"📗 Гүйлгаа баланс {d['year']} хөрвүүлж байна..."):
-                            d['file'].seek(0)
-                            buf, tb_s = process_raw_tb(d['file'])
-                            if tb_s is not None and not tb_s.empty:
-                                st.session_state.tb_res[d['year']] = {'buf': buf.getvalue(), 'tb': tb_s}
-                                st.success(f"✅ TB {d['year']}: {len(tb_s):,} данс")
-                            else:
-                                st.warning(f"⚠️ {d['name']} файлаас TB мөр уншигдсангүй. Формат шалгана уу.")
-                if edts:
-                    if 'led_res' not in st.session_state:
-                        st.session_state.led_res = {}
-                    edt_by_year = {}
-                    for d in edts:
-                        edt_by_year.setdefault(d['year'], []).append(d['file'])
-                    for yr in sorted(edt_by_year):
-                        with st.spinner(f"📘 Ерөнхий журнал {yr} хөрвүүлж байна ({len(edt_by_year[yr])} файл)..."):
-                            frames = []
-                            for f in edt_by_year[yr]:
-                                f.seek(0)
-                                df_e, cnt_e = process_edt(f, yr)
-                                if cnt_e > 0:
-                                    frames.append(df_e)
-                            if frames:
-                                st.session_state.led_res[yr] = pd.concat(frames, ignore_index=True)
-                                # Дансны нэр нэгтгэх (хэрэв лавлах файл өгсөн бол)
-                                if acct_name_map:
-                                    st.session_state.led_res[yr] = merge_account_names(st.session_state.led_res[yr], acct_name_map)
-                                st.success(f"✅ ЕЖ {yr}: {len(st.session_state.led_res[yr]):,} гүйлгээ")
-                            else:
-                                st.warning(f"⚠️ {yr} оны ЕЖ файл(уудаас) гүйлгээ уншигдсангүй. Файлын формат шалгана уу.")
-
-    if 'tb_res' in st.session_state and st.session_state.tb_res:
-        st.markdown("---\n### 📥 TB файлууд")
-        for yr in sorted(st.session_state.tb_res):
-            d = st.session_state.tb_res[yr]
-            st.download_button(f"📥 TB_standardized_{yr}.xlsx ({len(d['tb']):,} данс)", d['buf'], f"TB_standardized_{yr}1231.xlsx", key=f"dtb{yr}")
-
-    if 'led_res' in st.session_state and st.session_state.led_res:
-        st.markdown("---\n### 📥 Ledger + Part1")
-        cols_out = ['report_year','account_code','account_name','transaction_no','transaction_date','journal_no','document_no','counterparty_name','counterparty_id','transaction_description','debit_mnt','credit_mnt','balance_mnt','month']
-        for yr in sorted(st.session_state.led_res):
-            dfy = st.session_state.led_res[yr]
-            if dfy.empty or 'debit_mnt' not in dfy.columns:
-                st.warning(f"⚠️ {yr} оны ЕЖ файлаас гүйлгээ уншигдсангүй. Файлын формат тохирохгүй байж магадгүй.")
+def _build_part1_from_prepared_ledgers():
+    ledger_files = _cache_files('prepared_ledger_cache')
+    created = 0
+    for lf in ledger_files:
+        try:
+            year = get_year(lf.name)
+            lf.seek(0)
+            led_df = read_ledger(lf)
+            if led_df.empty:
                 continue
-            dfy['debit_mnt'] = pd.to_numeric(dfy['debit_mnt'], errors='coerce').fillna(0)
-            dfy['credit_mnt'] = pd.to_numeric(dfy['credit_mnt'], errors='coerce').fillna(0)
-            with st.expander(f"📅 {yr} — {len(dfy):,} гүйлгээ", expanded=True):
-                p1_buf, p1_mo, p1_acct, p1_rm, n_risk = generate_part1(dfy, yr)
-                c1x, c2x, c3x = st.columns(3)
-                c1x.metric("Гүйлгээ", f"{len(dfy):,}")
-                c2x.metric("Дансны бичилтийн тоо", f"{len(p1_rm):,}")
-                c3x.metric("Эрсдэлтэй бичилт", f"{n_risk:,}")
-                gz_bytes = gzip.compress(dfy[cols_out].to_csv(index=False).encode('utf-8'))
-                st.download_button(f"📥 ledger_{yr}.csv.gz", gz_bytes, f"prototype_ledger_{yr}.csv.gz", key=f"dled{yr}")
-                st.download_button(f"📥 part1_{yr}.xlsx", p1_buf.getvalue(), f"prototype_part1_{yr}.xlsx", key=f"dp1{yr}")
+            part1_buf, _, _, _, _ = generate_part1(led_df, year)
+            out_name = f'Part1_generated_{year}_{Path(lf.name).stem[:40]}.xlsx'
+            _cache_add('prepared_part1_cache', out_name, part1_buf.getvalue())
+            created += 1
+        except Exception:
+            continue
+    return created
 
-# ═══════════════════════════════════════
-# 2️⃣ ШИНЖИЛГЭЭ
-# ═══════════════════════════════════════
+
+def _render_downloads(title, cache_key, mime):
+    files = st.session_state.get(cache_key, {})
+    if files:
+        st.markdown(title)
+        for name, raw in files.items():
+            st.download_button(f'📥 {name}', raw, file_name=name, mime=mime, key=f'dl_{cache_key}_{name}')
+
+
+def _show_dataframe_download(df, filename, label='📥 CSV татах'):
+    if df is not None and not df.empty:
+        st.download_button(label, _df_to_csv_bytes(df), file_name=filename, mime='text/csv', key=f'dl_{filename}')
+
+
+if page.startswith("1"):
+    st.header("1️⃣ Өгөгдөл оруулах, бэлтгэх")
+    st.markdown("Файлаа нэг удаа оруулаад дараагийн цэсүүд дээр дахин ашиглаж болно.")
+
+    uploaded = st.file_uploader("📎 Бүх файлуудаа энд оруулна уу", type=['xlsx', 'csv', 'gz'], accept_multiple_files=True, key='smart_prep_main')
+    acct_name_file = st.file_uploader("📋 Дансны нэрийн лавлах файл (заавал биш)", type=['xlsx'], key='acct_names_prep_main')
+    acct_name_map = parse_account_names(acct_name_file) if acct_name_file else {}
+
+    cpa, cpb = st.columns([1,1])
+    with cpa:
+        if st.button('🛠️ Файлуудыг таньж бэлтгэх', type='primary', use_container_width=True):
+            if uploaded:
+                _prepare_from_uploaded(uploaded, acct_name_map)
+                created = _build_part1_from_prepared_ledgers()
+                st.success(f'✅ Файлууд бэлтгэгдлээ. Ledger-ээс {created} Part1 файл үүсгэлээ.')
+            else:
+                st.warning('Файл оруулна уу.')
+    with cpb:
+        if st.button('🧹 Бүх хадгалсан өгөгдлийг цэвэрлэх', use_container_width=True):
+            for key in ['prepared_tb_cache','prepared_part1_cache','prepared_ledger_cache','prep_detected_rows',
+                        'tb_analysis_done','journal_ai_done','tb_all','tb_stats','rm_all','mo_all','tb_filtered',
+                        'tb_ml_df','tb_feature_importance','journal_ml_result','journal_ml_show',
+                        'journal_model_summary','journal_xai','journal_ledger_stats','tb_upload_cache','journal_upload_cache']:
+                if key in st.session_state:
+                    if isinstance(st.session_state[key], dict): st.session_state[key] = {}
+                    elif isinstance(st.session_state[key], list): st.session_state[key] = []
+                    elif isinstance(st.session_state[key], bool): st.session_state[key] = False
+                    else: st.session_state[key] = pd.DataFrame() if 'df' in key or key in ['tb_all','rm_all','mo_all','tb_filtered','tb_ml_df','tb_feature_importance','journal_ml_result','journal_ml_show','journal_model_summary','journal_xai'] else ''
+            st.success('Session цэвэрлэгдлээ.')
+
+    if st.session_state.get('prep_detected_rows'):
+        st.dataframe(pd.DataFrame(st.session_state['prep_detected_rows']), use_container_width=True, hide_index=True)
+
+    ca, cb, cc = st.columns(3)
+    with ca:
+        st.metric('TB файл', len(st.session_state.get('prepared_tb_cache', {})))
+    with cb:
+        st.metric('Ledger файл', len(st.session_state.get('prepared_ledger_cache', {})))
+    with cc:
+        st.metric('Part1 файл', len(st.session_state.get('prepared_part1_cache', {})))
+
+    _render_downloads('### 📦 Бэлэн болсон TB файлууд', 'prepared_tb_cache', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    _render_downloads('### 📦 Бэлэн болсон Ledger файлууд', 'prepared_ledger_cache', 'text/csv')
+    _render_downloads('### 📦 Бэлэн болсон Part1 файлууд', 'prepared_part1_cache', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+
 elif page.startswith("2"):
-    st.header("2️⃣ Гүйлгээ балансын шинжилгээ (TB + Part1)")
-    st.markdown("""
-    <div style="background-color: #E8F5E9; padding: 15px; border-radius: 8px; border-left: 4px solid #2E7D32; margin-bottom: 15px;">
-        <b>📂 TB төвтэй шинжилгээ.</b> Энэ цэс нь зөвхөн Гүйлгээ баланс, TB_standardized, Part1 файлуудаар ажиллана.<br>
-        <span style="color: #555; font-size: 13px;">
-        Ерөнхий журналын гүйлгээний ML/XAI шинжилгээг 3️⃣ цэс рүү бүрэн шилжүүлсэн. Энэ цэсэнд journal/ledger файл оруулсан ч transaction AI ажиллахгүй.
-        </span>
-    </div>
-    """, unsafe_allow_html=True)
+    st.header("2️⃣ Гүйлгээ балансын шинжилгээ")
+    st.markdown("Энэ хэсэг зөвхөн TB болон Part1-ээр ажиллана. Ерөнхий журналын ML шинжилгээг 3️⃣ цэсэнд хийнэ.")
 
-    all_files = st.file_uploader("📎 TB / Гүйлгээ баланс / Part1 файлуудаа энд оруулна уу", type=['xlsx', 'csv', 'gz'], accept_multiple_files=True, key='smart_analysis')
+    all_files = st.file_uploader("📎 Нэмэлт TB / Part1 файл оруулах", type=['xlsx'], accept_multiple_files=True, key='tb_page_upload')
     if all_files:
         st.session_state.tb_upload_cache = uploaded_files_to_cache(all_files)
     elif st.session_state.get('tb_upload_cache'):
         all_files = cache_to_file_objects(st.session_state.tb_upload_cache)
-        st.info(f"💾 Өмнө оруулсан {len(all_files)} файл session-д хадгалагдсан байна.")
+        st.info(f"💾 Өмнө оруулсан {len(all_files)} TB/Part1 файл хадгалагдсан байна.")
 
-    tb_files = []
-    p1_files = []
-    ignored_rows = []
+    tb_files = _cache_files('prepared_tb_cache')
+    p1_files = _cache_files('prepared_part1_cache')
+    detect_rows = []
+    for f in all_files or []:
+        ftype, year = detect_file_type(f)
+        f.seek(0)
+        detect_rows.append({'Файл': f.name, 'Төрөл': FILE_TYPE_LABELS.get(ftype, FILE_TYPE_LABELS['unknown'])[0], 'Он': year})
+        if ftype == 'raw_tb':
+            buf, tb_sum = process_raw_tb(f)
+            if tb_sum is not None and not tb_sum.empty:
+                bio = io.BytesIO(buf.getvalue()); bio.name = f'TB_standardized_{year}_{Path(f.name).stem}.xlsx'
+                tb_files.append(bio)
+        elif ftype == 'tb_std':
+            tb_files.append(f)
+        elif ftype == 'part1':
+            p1_files.append(f)
+    if detect_rows:
+        st.dataframe(pd.DataFrame(detect_rows), use_container_width=True, hide_index=True)
 
-    if all_files:
-        detected = []
-        for f in all_files:
-            ftype, year = detect_file_type(f)
-            f.seek(0)
-            detected.append({'file': f, 'type': ftype, 'year': year, 'name': f.name})
-
-        det_rows = []
-        for d in detected:
-            label, desc = FILE_TYPE_LABELS.get(d['type'], FILE_TYPE_LABELS['unknown'])
-            if d['type'] in ('ledger','edt'):
-                desc = desc + ' → 3️⃣ Ерөнхий журналын шинжилгээ цэсэнд ашиглана.'
-                ignored_rows.append(d['name'])
-            det_rows.append({'Файл': d['name'], 'Төрөл': label, 'Он': d['year'], 'Тайлбар': desc})
-        st.session_state.tb_detected_rows = det_rows
-    if st.session_state.get('tb_detected_rows'):
-        st.dataframe(pd.DataFrame(st.session_state.tb_detected_rows), use_container_width=True, hide_index=True)
-
-    if all_files:
-        for d in detected:
-            if d['type'] == 'tb_std':
-                tb_files.append(d['file'])
-            elif d['type'] == 'part1':
-                p1_files.append(d['file'])
-            elif d['type'] == 'raw_tb':
-                with st.spinner(f"📗 {d['name']} → TB хөрвүүлж байна..."):
-                    d['file'].seek(0)
-                    buf, tb_s = process_raw_tb(d['file'])
-                    if tb_s is not None and not tb_s.empty:
-                        tb_wrap = io.BytesIO(buf.getvalue())
-                        tb_wrap.name = f"TB_standardized_{d['year']}1231.xlsx"
-                        tb_files.append(tb_wrap)
-                        st.success(f"✅ {d['name']} → TB хөрвүүлсэн")
-                    else:
-                        st.warning(f"⚠️ {d['name']} — TB мөр уншигдсангүй. Формат шалгана уу.")
-
-        if ignored_rows:
-            st.info("ℹ️ Дараах journal/ledger файлуудыг энэ цэсэнд шинжлэхгүй: " + ", ".join(ignored_rows))
-
-    st.markdown("""
-    <div style="background:#F5F5F5; padding:12px; border-radius:8px; margin-bottom:10px;">
-    <b>⚙️ TB шинжилгээний тохиргоо</b>
-    </div>
-    """, unsafe_allow_html=True)
     c1s, c2s = st.columns(2)
     with c1s:
-        cont = st.slider("🎯 Хэвийн бус дансны хувь (Isolation Forest)", 0.05, 0.20, 0.10, 0.01, key='tb_cont')
+        cont = st.slider("🎯 Хэвийн бус дансны хувь (Isolation Forest)", 0.05, 0.20, 0.10, 0.01, key='tb_cont_work')
     with c2s:
-        nest = st.slider("🌲 Шийдвэрийн модны тоо (Random Forest)", 50, 500, 200, 50, key='tb_nest')
+        nest = st.slider("🌲 Random Forest модны тоо", 50, 500, 200, 50, key='tb_nest_work')
 
     with st.expander("🏷️ Эрсдэлийн шинжилгээнээс хасах бүлгүүд", expanded=False):
-        st.markdown("Доорх ангиллын данснуудыг эрсдэлийн жагсаалтаас хасаж болно.")
         excl_settings = {}
         for tag, rule in EXCL_RULES.items():
-            excl_settings[tag] = st.checkbox(rule['label'], value=rule.get('default', False), help=rule.get('help',''), key=f'excl_{tag}')
+            excl_settings[tag] = st.checkbox(rule['label'], value=rule.get('default', False), help=rule.get('help',''), key=f'tb_excl_{tag}')
 
-    if tb_files or p1_files:
-        run_tb = st.button('🚀 TB шинжилгээ эхлүүлэх', type='primary', use_container_width=True, key='run_tb_only')
-        if run_tb:
+    st.caption(f"Бэлэн TB: {len(tb_files)} файл • Бэлэн Part1: {len(p1_files)} файл")
+    if st.button('🚀 TB шинжилгээ эхлүүлэх', type='primary', use_container_width=True, key='run_tb_analysis_main'):
+        try:
             tb_all, tb_stats = load_tb(tb_files) if tb_files else (pd.DataFrame(), {})
             rm_all, mo_all = load_part1(p1_files) if p1_files else (pd.DataFrame(), pd.DataFrame())
-            if tb_all.empty and rm_all.empty and mo_all.empty:
-                st.warning('⚠️ TB/Part1 өгөгдөл олдсонгүй.')
+            tb_show = tb_all.copy()
+            if not tb_show.empty:
+                tb_show = classify_exclusions(tb_show, level='account')
+                active_tags = [k for k, v in excl_settings.items() if v]
+                if active_tags:
+                    tb_show = tb_show[~tb_show['exclusion_tag'].isin(active_tags)].copy()
+                ml_df, X, y, feats, res, best, fi, ym = run_ml(tb_show, cont, nest)
             else:
-                tb_show = tb_all.copy()
-                if not tb_show.empty:
-                    tb_show = classify_exclusions(tb_show, level='account')
-                    active_tags = [k for k,v in excl_settings.items() if v]
-                    if active_tags:
-                        tb_show = tb_show[~tb_show['exclusion_tag'].isin(active_tags)].copy()
-                if not tb_show.empty:
-                    ml_df, X, y, feats, res, best, fi, ym = run_ml(tb_show, cont, nest)
-                else:
-                    ml_df, fi = pd.DataFrame(), pd.DataFrame()
-                st.session_state['tb_analysis_done'] = True
-                st.session_state['tb_all'] = tb_all
-                st.session_state['tb_stats'] = tb_stats
-                st.session_state['rm_all'] = rm_all
-                st.session_state['mo_all'] = mo_all
-                st.session_state['tb_filtered'] = tb_show
-                st.session_state['tb_ml_df'] = ml_df
-                st.session_state['tb_feature_importance'] = fi
+                ml_df, fi = pd.DataFrame(), pd.DataFrame()
+            st.session_state['tb_analysis_done'] = True
+            st.session_state['tb_all'] = tb_all
+            st.session_state['tb_stats'] = tb_stats
+            st.session_state['rm_all'] = rm_all
+            st.session_state['mo_all'] = mo_all
+            st.session_state['tb_filtered'] = tb_show
+            st.session_state['tb_ml_df'] = ml_df
+            st.session_state['tb_feature_importance'] = fi
+            st.session_state['tb_error'] = ''
+            st.success('✅ TB шинжилгээ дууслаа.')
+        except Exception as e:
+            st.session_state['tb_error'] = str(e)
+            st.exception(e)
 
-    has_any = st.session_state.get('tb_analysis_done', False)
-    tb_all = st.session_state.get('tb_all', pd.DataFrame())
-    tb_stats = st.session_state.get('tb_stats', {})
-    rm_all = st.session_state.get('rm_all', pd.DataFrame())
-    mo_all = st.session_state.get('mo_all', pd.DataFrame())
-    ml_df = st.session_state.get('tb_ml_df', pd.DataFrame())
-    fi = st.session_state.get('tb_feature_importance', pd.DataFrame())
+    if st.session_state.get('tb_error'):
+        st.error(st.session_state['tb_error'])
 
-    if has_any:
-        if tb_stats:
-            rows = []
-            for yr, vals in sorted(tb_stats.items()):
-                rows.append({'Он': yr, 'Данс': vals.get('accounts', 0), 'Дебит эргэлт': vals.get('turnover_d', 0), 'Кредит эргэлт': vals.get('turnover_c', 0)})
-            st.markdown('### 📊 TB summary')
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    if st.session_state.get('tb_analysis_done', False):
+        tb_stats = st.session_state.get('tb_stats', {})
+        rm_all = st.session_state.get('rm_all', pd.DataFrame())
+        mo_all = st.session_state.get('mo_all', pd.DataFrame())
+        ml_df = st.session_state.get('tb_ml_df', pd.DataFrame())
+        fi = st.session_state.get('tb_feature_importance', pd.DataFrame())
 
-        if not ml_df.empty:
-            st.markdown('### 🤖 TB аномали шинжилгээ')
-            show_cols = [c for c in ['year','account_code','account_name','iso_anomaly','zscore_anomaly','turn_anomaly','ensemble_anomaly'] if c in ml_df.columns]
-            st.dataframe(ml_df.sort_values('ensemble_anomaly', ascending=False)[show_cols].head(300), use_container_width=True, hide_index=True)
+        years_available = []
+        if isinstance(tb_stats, dict) and tb_stats:
+            years_available = sorted(tb_stats.keys())
+        elif not ml_df.empty and 'year' in ml_df.columns:
+            years_available = sorted(pd.to_numeric(ml_df['year'], errors='coerce').dropna().astype(int).unique().tolist())
+
+        selected_year = None
+        if years_available:
+            default_idx = len(years_available) - 1
+            selected_year = st.selectbox('📅 TB аномали шинжилгээний он', years_available, index=default_idx, key='tb_year_selector_v52')
+
+        st.markdown("""
+        ### 📘 TB шинжилгээний тайлбар
+        Энд дансны түвшний AI шинжилгээг табуудаар харуулна.
+
+        - **🤖 TB аномали**: данс тус бүрийн хэвийн бус хөдөлгөөн
+        - **🔎 TB XAI**: эрсдэлийг тайлбарлаж буй гол feature-үүд
+        - **📋 Part1 эрсдэлийн матриц**: сар-данс-харилцагчийн эрсдэлийн нэгтгэл
+        - **📈 Сарын хандлага**: дебит, кредитийн сарын динамик
+        """)
+
+        tab1, tab2, tab3, tab4 = st.tabs(['🤖 TB аномали', '🔎 TB XAI / Feature importance', '📋 Part1 эрсдэлийн матриц', '📈 Сарын хандлага'])
+
+        with tab1:
+            if tb_stats:
+                rows = [{'Он': yr, 'Данс': vals.get('accounts', 0), 'Дебит эргэлт': vals.get('turnover_d', 0), 'Кредит эргэлт': vals.get('turnover_c', 0)} for yr, vals in sorted(tb_stats.items())]
+                st.markdown('#### 📊 TB summary')
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+            if not ml_df.empty:
+                ml_show = ml_df.copy()
+                if selected_year is not None and 'year' in ml_show.columns:
+                    ml_show = ml_show[pd.to_numeric(ml_show['year'], errors='coerce') == int(selected_year)].copy()
+
+                total_accounts = len(ml_show)
+                total_anomaly = int(ml_show['ensemble_anomaly'].sum()) if 'ensemble_anomaly' in ml_show.columns else 0
+                anomaly_rate = (total_anomaly / total_accounts * 100) if total_accounts else 0
+
+                m1, m2, m3 = st.columns(3)
+                m1.metric('Нийт данс', f'{total_accounts:,}')
+                m2.metric('Аномали данс', f'{total_anomaly:,}')
+                m3.metric('Аномалийн хувь', f'{anomaly_rate:.1f}%')
+
+                st.markdown(f'#### 🤖 {selected_year if selected_year is not None else "Бүх он"} TB аномали шинжилгээ')
+                st.caption('Isolation Forest, Z-score, Turnover ratio, Ensemble аномалийг нэгтгэн харуулав.')
+                show_cols = [c for c in ['year','account_code','account_name','iso_anomaly','zscore_anomaly','turn_anomaly','ensemble_anomaly'] if c in ml_show.columns]
+                sort_cols = ['ensemble_anomaly', 'year'] if 'year' in ml_show.columns else ['ensemble_anomaly']
+                ascending = [False, True] if 'year' in ml_show.columns else [False]
+                st.dataframe(ml_show.sort_values(sort_cols, ascending=ascending)[show_cols].head(1000), use_container_width=True, hide_index=True)
+                _show_dataframe_download(ml_show, f'tb_anomaly_results_{selected_year if selected_year is not None else "all"}.csv')
+            else:
+                st.info('TB аномали шинжилгээний үр дүн хараахан үүсээгүй байна.')
+
+        with tab2:
+            st.markdown('#### 🔎 TB XAI / Feature importance')
+            st.caption('Энэ хэсэгт AI систем ямар үзүүлэлтээр дансыг эрсдэлтэй гэж үнэлснийг харуулна.')
             if not fi.empty:
-                st.markdown('### 🔎 TB XAI / Feature importance')
                 st.dataframe(fi, use_container_width=True, hide_index=True)
+                try:
+                    fig_fi = px.bar(fi.sort_values('importance', ascending=True), x='importance', y='feature', orientation='h', title='TB Feature importance')
+                    fig_fi.update_layout(height=420, yaxis_title='Feature', xaxis_title='Importance')
+                    st.plotly_chart(fig_fi, use_container_width=True)
+                except Exception:
+                    pass
+            else:
+                st.info('Feature importance одоогоор байхгүй байна.')
 
-        if not rm_all.empty:
-            st.markdown('### 📋 Part1 эрсдэлийн матриц')
-            st.dataframe(rm_all.head(300), use_container_width=True, hide_index=True)
+        with tab3:
+            st.markdown('#### 📋 Part1 эрсдэлийн матриц')
+            st.caption('Сар, данс, харилцагчийн түвшинд том дүн болон өндөр давтамжийн эрсдэлийг харуулна.')
+            if not rm_all.empty:
+                rm_show = rm_all.copy()
+                if selected_year is not None and 'year' in rm_show.columns:
+                    rm_show = rm_show[pd.to_numeric(rm_show['year'], errors='coerce') == int(selected_year)].copy()
+                st.dataframe(rm_show.head(1000), use_container_width=True, hide_index=True)
+                _show_dataframe_download(rm_show, f'part1_risk_matrix_{selected_year if selected_year is not None else "all"}.csv')
+            else:
+                st.info('Part1 эрсдэлийн матриц олдсонгүй.')
 
-        if not mo_all.empty:
-            st.markdown('### 📈 Сарын хандлага')
-            mo_plot = mo_all.copy()
-            if 'total_debit_mnt' in mo_plot.columns:
-                mo_plot['total_debit_mnt'] = pd.to_numeric(mo_plot['total_debit_mnt'], errors='coerce').fillna(0)
-                fig_mo = px.line(mo_plot, x='month', y='total_debit_mnt', color='year' if 'year' in mo_plot.columns else None, title='Сарын дебит хөдөлгөөн')
-                st.plotly_chart(fig_mo, use_container_width=True)
+        with tab4:
+            st.markdown('#### 📈 Сарын хандлага')
+            st.caption('TB/Part1-ээс үүссэн сарын хөдөлгөөнийг интерактив байдлаар харуулна.')
+            if not mo_all.empty and 'month' in mo_all.columns:
+                mo_plot = mo_all.copy()
+                if selected_year is not None and 'year' in mo_plot.columns:
+                    mo_plot = mo_plot[pd.to_numeric(mo_plot['year'], errors='coerce') == int(selected_year)].copy()
+
+                value_options = [c for c in ['total_debit_mnt', 'total_credit_mnt', 'ending_balance_mnt', 'transaction_count'] if c in mo_plot.columns]
+                if value_options:
+                    selected_metric = st.selectbox('📌 Сарын үзүүлэлт', value_options, key='tb_month_metric_v52')
+                    mo_plot[selected_metric] = pd.to_numeric(mo_plot[selected_metric], errors='coerce').fillna(0)
+                    color_arg = 'account_code' if 'account_code' in mo_plot.columns and mo_plot['account_code'].nunique() <= 15 else None
+                    fig_mo = px.line(mo_plot.sort_values('month'), x='month', y=selected_metric, color=color_arg, markers=True, title=f'Сарын хандлага — {selected_metric}')
+                    fig_mo.update_layout(height=460, xaxis_title='Сар', yaxis_title=selected_metric)
+                    st.plotly_chart(fig_mo, use_container_width=True)
+                    st.dataframe(mo_plot.head(500), use_container_width=True, hide_index=True)
+                    _show_dataframe_download(mo_plot, f'monthly_trend_{selected_year if selected_year is not None else "all"}.csv')
+                else:
+                    st.info('Сарын хандлагын тоон баганууд олдсонгүй.')
+            else:
+                st.info('Сарын хандлагын өгөгдөл олдсонгүй.')
     else:
-        st.info('👆 TB / Part1 файлаа оруулж шинжилгээг эхлүүлнэ үү.')
+        st.info('👆 Энд шууд файл оруулах эсвэл 1️⃣ цэсэнд бэлтгэсэн TB/Part1 файлаа ашиглаад шинжилгээг эхлүүлнэ үү.')
 
 elif page.startswith("3"):
-    st.header("3️⃣ Ерөнхий журналын шинжилгээ — ML + XAI")
-    st.markdown("""
-    <div style="background-color: #F3E5F5; padding: 15px; border-radius: 8px; border-left: 4px solid #7B1FA2; margin-bottom: 15px;">
-        <b>🧠 Ерөнхий журналын тусдаа шинжилгээ</b> — journal/ledger файлуудыг энд төвлөрүүлж, ML ensemble + XAI тайлбар гаргана.<br>
-        <span style="color: #555; font-size: 13px;">
-        Хуудас хооронд шилжсэн ч өмнөх upload, хөрвүүлэлт, шинжилгээний үр дүн session-д хадгалагдана.
-        </span>
-    </div>
-    """, unsafe_allow_html=True)
+    st.header("3️⃣ Ерөнхий журналын шинжилгээ")
+    st.markdown("Ledger/ЕЖ файлуудын transaction-level ML + XAI шинжилгээ.")
 
-    ej_files = st.file_uploader("📎 ЕЖ эсвэл ledger файлуудаа энд оруулна уу", type=['xlsx','csv','gz'], accept_multiple_files=True, key='journal_analysis_files')
+    ej_files = st.file_uploader("📎 Нэмэлт ЕЖ эсвэл ledger файл оруулах", type=['xlsx','csv','gz'], accept_multiple_files=True, key='journal_page_upload')
     if ej_files:
         st.session_state.journal_upload_cache = uploaded_files_to_cache(ej_files)
     elif st.session_state.get('journal_upload_cache'):
         ej_files = cache_to_file_objects(st.session_state.journal_upload_cache)
-        st.info(f"💾 Өмнө оруулсан {len(ej_files)} journal файл session-д хадгалагдсан байна.")
+        st.info(f"💾 Өмнө оруулсан {len(ej_files)} journal файл хадгалагдсан байна.")
+
+    prepared_ledger_files = _cache_files('prepared_ledger_cache')
+    journal_inputs = []
+    detect_rows_j = []
+    for f in prepared_ledger_files:
+        journal_inputs.append(('ledger', f, get_year(f.name)))
+    for f in ej_files or []:
+        ftype, year = detect_file_type(f)
+        f.seek(0)
+        detect_rows_j.append({'Файл': f.name, 'Төрөл': FILE_TYPE_LABELS.get(ftype, FILE_TYPE_LABELS['unknown'])[0], 'Он': year})
+        if ftype in ('ledger', 'edt'):
+            journal_inputs.append((ftype, f, year))
+    if detect_rows_j:
+        st.dataframe(pd.DataFrame(detect_rows_j), use_container_width=True, hide_index=True)
+
+    cj1, cj2 = st.columns(2)
+    with cj1:
+        j_cont = st.slider('🎯 Аномалийн хувь', 0.01, 0.20, 0.05, 0.01, key='j_cont_work')
+    with cj2:
+        j_clusters = st.slider('🧩 KMeans кластерын тоо', 2, 20, 8, 1, key='j_clusters_work')
 
     with st.expander("🏷️ Эрсдэлийн шинжилгээнээс хасах бүлгүүд", expanded=False):
-        st.markdown("NaN / дутуу өгөгдөл автоматаар хасагдана. Доорх бусад бүлгийг хүсвэл идэвхжүүлж/унтрааж болно.")
         excl_settings_j = {}
         for tag, rule in EXCL_RULES.items():
-            if tag == 'идэвхгүй':
-                continue
             excl_settings_j[tag] = st.checkbox(rule['label'], value=rule.get('default', False), help=rule.get('help',''), key=f'j_excl_{tag}')
 
-    j_cont = st.slider('Аномалийн хувь (contamination)', 0.01, 0.20, 0.05, 0.01, key='j_cont')
-    j_clusters = st.slider('KMeans cluster тоо', 2, 15, 8, 1, key='j_clusters')
-
-    led_files_j = []
-    if ej_files:
-        detected_j = []
-        for f in ej_files:
-            ftype, year = detect_file_type(f)
-            f.seek(0)
-            detected_j.append({'file': f, 'type': ftype, 'year': year, 'name': f.name})
-
-        det_rows_j = []
-        for d in detected_j:
-            label, desc = FILE_TYPE_LABELS.get(d['type'], FILE_TYPE_LABELS['unknown'])
-            det_rows_j.append({'Файл': d['name'], 'Төрөл': label, 'Он': d['year'], 'Тайлбар': desc})
-        st.session_state.journal_detected_rows = det_rows_j
-
-        for d in detected_j:
-            try:
-                if d['type'] == 'ledger':
-                    d['file'].seek(0)
-                    led_files_j.append(d['file'])
-                elif d['type'] == 'edt':
-                    with st.spinner(f"📘 {d['name']} → ledger хөрвүүлж байна..."):
-                        d['file'].seek(0)
-                        df_edt_j, cnt_j = process_edt(d['file'], d['year'])
-                    if cnt_j > 0 and not df_edt_j.empty:
-                        bio_j = io.BytesIO(df_edt_j.to_csv(index=False).encode('utf-8'))
-                        bio_j.name = f'prototype_ledger_{d["year"]}.csv'
-                        led_files_j.append(bio_j)
-                    else:
-                        st.warning(f"⚠️ {d['name']} файлаас гүйлгээ уншигдсангүй.")
-            except Exception as e:
-                st.error(f"{d['name']} файлыг бэлтгэх үед алдаа гарлаа: {e}")
-
-    if st.session_state.get('journal_detected_rows'):
-        st.dataframe(pd.DataFrame(st.session_state.journal_detected_rows), use_container_width=True, hide_index=True)
-
-    if led_files_j:
-        st.success(f"✅ Journal шинжилгээнд бэлэн файл: {len(led_files_j)}")
-    elif st.session_state.get('journal_ai_done', False):
-        st.info('Өмнөх journal шинжилгээний үр дүн хадгалагдсан байна.')
-
-    run_j = st.button('🚀 Ерөнхий журналын ML + XAI шинжилгээ эхлүүлэх', type='primary', use_container_width=True, key='run_journal_ai')
-    if run_j:
-        source_files = led_files_j if led_files_j else cache_to_file_objects(st.session_state.get('journal_upload_cache', {}))
+    st.caption(f"Бэлэн journal/ledger: {len(journal_inputs)} файл")
+    if st.button('🚀 Ерөнхий журналын шинжилгээ эхлүүлэх', type='primary', use_container_width=True, key='run_journal_analysis_main'):
         try:
-            ledger_stats_j, ledger_sample_j = load_ledger_stats(source_files, sample_per_year=50000, chunksize=100000)
-            if ledger_sample_j.empty:
-                st.warning('⚠️ Ledger өгөгдөл олдсонгүй.')
-            else:
-                ledger_sample_j = clean_for_risk(ledger_sample_j)
-                ml_result_j, ml_feats_j, model_summary_j, xai_importance_j = run_txn_ml_ensemble(ledger_sample_j, contamination=j_cont, n_clusters=j_clusters)
-                if ml_result_j.empty:
-                    st.warning('⚠️ ML шинжилгээ хийхэд хангалттай мөр алга.')
-                else:
-                    ml_result_j = classify_exclusions(ml_result_j, level='transaction')
-                    active_tags_j = [k for k,v in excl_settings_j.items() if v]
-                    ml_show_j = ml_result_j[~ml_result_j['exclusion_tag'].isin(active_tags_j)].copy() if active_tags_j else ml_result_j.copy()
-                    st.session_state['journal_ai_done'] = True
-                    st.session_state['journal_ml_result'] = ml_result_j
-                    st.session_state['journal_ml_show'] = ml_show_j
-                    st.session_state['journal_model_summary'] = model_summary_j
-                    st.session_state['journal_xai'] = xai_importance_j
-                    st.session_state['journal_ledger_stats'] = ledger_stats_j
-                    st.success('✅ Ерөнхий журналын шинжилгээ амжилттай дууслаа.')
+            frames = []
+            ledger_stats_j = {}
+            for typ, f, year in journal_inputs:
+                if typ == 'ledger':
+                    f.seek(0)
+                    led_df = read_ledger(f)
+                    if not led_df.empty:
+                        frames.append(led_df)
+                        ledger_stats_j[Path(f.name).name] = {'rows': len(led_df), 'accounts': led_df.get('account_code', pd.Series(dtype=str)).astype(str).nunique()}
+                elif typ == 'edt':
+                    f.seek(0)
+                    edt_df, cnt = process_edt(f, year)
+                    if cnt > 0 and not edt_df.empty:
+                        frames.append(edt_df)
+                        ledger_stats_j[Path(f.name).name] = {'rows': len(edt_df), 'accounts': edt_df.get('account_code', pd.Series(dtype=str)).astype(str).nunique()}
+            if not frames:
+                raise ValueError('Journal/ledger өгөгдөл олдсонгүй.')
+            ledger_sample_j = pd.concat(frames, ignore_index=True)
+            ledger_sample_j = clean_for_risk(ledger_sample_j)
+            ml_result_j, ml_feats_j, model_summary_j, xai_importance_j = run_txn_ml_ensemble(ledger_sample_j, contamination=j_cont, n_clusters=j_clusters)
+            if ml_result_j.empty:
+                raise ValueError('ML шинжилгээ хийхэд хангалттай мөр алга.')
+            ml_result_j = classify_exclusions(ml_result_j, level='transaction')
+            active_tags_j = [k for k, v in excl_settings_j.items() if v]
+            ml_show_j = ml_result_j[~ml_result_j['exclusion_tag'].isin(active_tags_j)].copy() if active_tags_j else ml_result_j.copy()
+            st.session_state['journal_ai_done'] = True
+            st.session_state['journal_ml_result'] = ml_result_j
+            st.session_state['journal_ml_show'] = ml_show_j
+            st.session_state['journal_model_summary'] = model_summary_j
+            st.session_state['journal_xai'] = xai_importance_j
+            st.session_state['journal_ledger_stats'] = ledger_stats_j
+            st.session_state['journal_error'] = ''
+            st.success('✅ Ерөнхий журналын шинжилгээ дууслаа.')
         except Exception as e:
+            st.session_state['journal_error'] = str(e)
             st.exception(e)
 
+    if st.session_state.get('journal_error'):
+        st.error(st.session_state['journal_error'])
+
     if st.session_state.get('journal_ai_done', False):
-        ml_result_j = st.session_state.get('journal_ml_result', pd.DataFrame())
         ml_show_j = st.session_state.get('journal_ml_show', pd.DataFrame())
         model_summary_j = st.session_state.get('journal_model_summary', pd.DataFrame())
         xai_importance_j = st.session_state.get('journal_xai', pd.DataFrame())
         ledger_stats_j = st.session_state.get('journal_ledger_stats', {})
 
-        if not ml_show_j.empty:
-            cja, cjb, cjc, cjd = st.columns(4)
-            cja.metric('Шинжилсэн гүйлгээ', f"{len(ml_result_j):,}")
-            cjb.metric('Хасагдсан бүлэг', f"{int((ml_result_j['exclusion_tag']!='').sum()):,}")
-            cjc.metric('Ensemble аномали', f"{int(ml_show_j['ml_anomaly_flag'].sum()):,}")
-            cjd.metric('Маш өндөр эрсдэл', f"{int((ml_show_j['ml_risk_level']=='🔴 Маш өндөр').sum()):,}")
-
-            st.markdown('### 🤖 Алгоритм тус бүрийн илрүүлэлт')
+        if ledger_stats_j:
+            st.markdown('### 📊 Journal summary')
+            st.dataframe(pd.DataFrame([{'Файл': k, 'Мөр': v.get('rows', 0), 'Данс': v.get('accounts', 0)} for k, v in ledger_stats_j.items()]), use_container_width=True, hide_index=True)
+        if not model_summary_j.empty:
+            st.markdown('### 🤖 Алгоритмын тойм')
             st.dataframe(model_summary_j, use_container_width=True, hide_index=True)
+        if not ml_show_j.empty:
+            st.markdown('### 🔍 Өндөр эрсдэлтэй journal гүйлгээ')
+            show_cols = [c for c in ['transaction_date','account_code','account_name','counterparty_name','amount','ml_vote_count','ml_risk_level','xai_top_feature','transaction_description'] if c in ml_show_j.columns]
+            sort_col = 'ml_vote_count' if 'ml_vote_count' in ml_show_j.columns else show_cols[0]
+            st.dataframe(ml_show_j.sort_values(sort_col, ascending=False)[show_cols].head(1000), use_container_width=True, hide_index=True)
+            _show_dataframe_download(ml_show_j, 'journal_ml_results.csv')
+        if not xai_importance_j.empty:
+            st.markdown('### 🧠 XAI / Feature importance')
+            st.dataframe(xai_importance_j, use_container_width=True, hide_index=True)
+            fig_fi = px.bar(xai_importance_j.head(15), x='importance', y='feature', orientation='h', title='Top XAI features')
+            st.plotly_chart(fig_fi, use_container_width=True)
+    else:
+        st.info('👆 1️⃣ цэсэнд бэлтгэсэн ledger/ЕЖ файлаа ашиглах эсвэл энд шууд оруулж шинжилгээг эхлүүлнэ үү.')
 
-            st.markdown('### 🔥 Эрсдэлтэй гүйлгээ')
-            top_cols = ['report_year','account_code','account_name','transaction_date','document_no','counterparty_name','transaction_description','debit_mnt','credit_mnt','ml_vote_count','ml_risk_level','xai_top_feature','exclusion_tag']
-            show_cols = [c for c in top_cols if c in ml_show_j.columns]
-            sort_cols = [c for c in ['ml_vote_count','debit_mnt','credit_mnt'] if c in ml_show_j.columns]
-            top_risk = ml_show_j.sort_values(sort_cols, ascending=[False]*len(sort_cols))[show_cols].head(500) if sort_cols else ml_show_j[show_cols].head(500)
-            st.dataframe(top_risk, use_container_width=True, hide_index=True)
-
-            if 'ml_vote_count' in ml_show_j.columns:
-                fig_vote = px.histogram(ml_show_j, x='ml_vote_count', title='ML vote count тархалт')
-                st.plotly_chart(fig_vote, use_container_width=True)
-
-            render_xai_summary(xai_importance_j, top_n=12)
-
-            csv_bytes_j = ml_show_j.to_csv(index=False).encode('utf-8')
-            st.download_button('📥 journal_ml_xai_results.csv', csv_bytes_j, 'journal_ml_xai_results.csv', key='dl_journal_ml_xai')
-
-            zip_buf = io.BytesIO()
-            with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
-                for acct, g in ml_show_j.groupby('account_code'):
-                    acct_clean = re.sub(r'[^0-9A-Za-z_-]+', '_', str(acct))[:80] or 'unknown'
-                    zf.writestr(f'journal_ml_{acct_clean}.csv', g.to_csv(index=False).encode('utf-8'))
-            st.download_button('📥 journal_ml_by_account.zip', zip_buf.getvalue(), 'journal_ml_by_account.zip', key='dl_journal_zip')
-
-            if ledger_stats_j:
-                st.markdown('### 📊 Ledger summary')
-                js_rows = []
-                for yr, vals in sorted(ledger_stats_j.items()):
-                    js_rows.append({'Он': yr, 'Гүйлгээ': vals.get('rows',0), 'Данс': vals.get('accounts',0), 'Сар': vals.get('months',0)})
-                st.dataframe(pd.DataFrame(js_rows), use_container_width=True, hide_index=True)
-        else:
-            st.info('ML/XAI үр дүн хараахан алга.')
-
-elif page.startswith("4"):
+else:
     st.header("4️⃣ Материаллаг байдлын тооцоо")
     st.markdown("""
-    <div style="background-color: #FFF8E1; padding: 15px; border-radius: 8px; border-left: 4px solid #F9A825; margin-bottom: 15px;">
-        <b>📐 Материаллаг байдлыг данс тус бүрээр тооцно.</b><br>
-        <span style="color: #555; font-size: 13px;">
-        TB_standardized эсвэл ГҮЙЛГЭЭ_БАЛАНС файлыг оруулж, нийт материаллаг байдлын дүнг өгөөд данс дансаар нь хуваарилж үзнэ.
-        </span>
-    </div>
-    """, unsafe_allow_html=True)
+    ### 📐 Материаллаг байдлын интерактив тооцоо
+    Энэ хэсэг нь TB өгөгдөл дээр суурилан материаллаг байдлыг данс бүрт хуваарилна.
 
-    mat_files = st.file_uploader(
-        "📎 TB эсвэл ГҮЙЛГЭЭ_БАЛАНС файлуудаа оруулна уу",
-        type=['xlsx'],
-        accept_multiple_files=True,
-        key='materiality_files'
-    )
+    - **Суурь дүн**: хаалтын үлдэгдэл эсвэл эргэлтийн дүн
+    - **Нийт материаллаг байдал**: таны оруулсан босго дүн
+    - **Хуваарилалт**: дансны жинлэлтийн дагуу автоматаар тооцоолно
+    """)
 
-    all_tb_files = []
-    det_rows = []
-    if mat_files:
-        for f in mat_files:
-            ftype, year = detect_file_type(f)
-            f.seek(0)
-            det_rows.append({'Файл': f.name, 'Төрөл': FILE_TYPE_LABELS.get(ftype, FILE_TYPE_LABELS['unknown'])[0], 'Он': year})
-            if ftype == 'tb_std':
-                all_tb_files.append(f)
-            elif ftype == 'raw_tb':
-                try:
-                    f.seek(0)
-                    buf, tb_s = process_raw_tb(f)
-                    if tb_s is not None and not tb_s.empty:
-                        bio = io.BytesIO(buf.getvalue())
-                        bio.name = f"TB_standardized_{year}1231.xlsx"
-                        all_tb_files.append(bio)
-                    else:
-                        st.warning(f"⚠️ {f.name} файлаас TB мөр уншигдсангүй.")
-                except Exception as e:
-                    st.warning(f"⚠️ {f.name} TB хөрвүүлэлт амжилтгүй: {e}")
+    mat_files = st.file_uploader("📎 Нэмэлт TB файл оруулах", type=['xlsx'], accept_multiple_files=True, key='mat_files_work')
+    tb_inputs = _cache_files('prepared_tb_cache')
+    for f in mat_files or []:
+        ftype, year = detect_file_type(f)
+        f.seek(0)
+        if ftype == 'tb_std':
+            tb_inputs.append(f)
+        elif ftype == 'raw_tb':
+            buf, tb_sum = process_raw_tb(f)
+            if tb_sum is not None and not tb_sum.empty:
+                bio = io.BytesIO(buf.getvalue()); bio.name = f'TB_standardized_{year}_{Path(f.name).stem}.xlsx'
+                tb_inputs.append(bio)
 
-        if det_rows:
-            st.dataframe(pd.DataFrame(det_rows), use_container_width=True, hide_index=True)
+    cmat1, cmat2 = st.columns(2)
+    with cmat1:
+        total_mat = st.number_input('Нийт материаллаг байдлын дүн', min_value=0.0, value=float(st.session_state.get('materiality_total_input', 1000000.0)), step=100000.0)
+    with cmat2:
+        basis_option = st.selectbox('📊 Хуваарилалтын суурь', ['Хаалтын үлдэгдэл', 'Эргэлтийн нийлбэр'], key='materiality_basis_v52')
+    st.session_state['materiality_total_input'] = total_mat
 
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        overall = st.number_input("Нийт материаллаг байдлын дүн", min_value=0.0, value=10000000.0, step=1000000.0, format="%.2f", key='mat_overall')
-    with c2:
-        perf_ratio = st.slider("Гүйцэтгэлийн материаллаг байдлын хувь", 0.4, 0.95, 0.75, 0.05, key='mat_perf_ratio')
-    with c3:
-        trivial_ratio = st.slider("Анхаарах доод дүнгийн хувь", 0.01, 0.20, 0.05, 0.01, key='mat_trivial_ratio')
-
-    tb_all = pd.DataFrame()
-    if all_tb_files:
-        tb_all, tb_stats = load_tb(all_tb_files)
-
-    years = sorted(tb_all['year'].dropna().unique().tolist()) if not tb_all.empty and 'year' in tb_all.columns else []
-    selected_year = None
-    if years:
-        selected_year = st.selectbox("Жил сонгох", options=years, index=len(years)-1, key='materiality_selected_year')
-
-    if st.button("📊 Материаллаг байдлыг тооцох", type="primary", use_container_width=True, disabled=tb_all.empty):
+    if st.button('📐 Материаллаг байдлыг тооцоолох', type='primary', use_container_width=True):
+        tb_all, _ = load_tb(tb_inputs) if tb_inputs else (pd.DataFrame(), {})
         if tb_all.empty:
-            st.warning("⚠️ Материаллаг байдлын тооцоонд ашиглах TB өгөгдөл олдсонгүй.")
+            st.warning('TB өгөгдөл олдсонгүй.')
         else:
-            tb_year = tb_all[tb_all['year'] == selected_year].copy() if selected_year is not None else tb_all.copy()
-            if tb_year.empty:
-                st.warning("⚠️ Сонгосон жилд TB өгөгдөл байхгүй.")
+            d = tb_all.copy()
+            if basis_option == 'Хаалтын үлдэгдэл':
+                base_amt = pd.to_numeric(d.get('closing_debit', 0), errors='coerce').fillna(0).abs() + pd.to_numeric(d.get('closing_credit', 0), errors='coerce').fillna(0).abs()
             else:
-                overall_use = overall if overall > 0 else materiality_base_from_tb(tb_year) * 0.01
-                mat_df = build_materiality_by_account(tb_year, overall_use, perf_ratio, trivial_ratio)
-                st.session_state['materiality_done'] = True
-                st.session_state['materiality_df'] = mat_df
-                st.session_state['materiality_year'] = selected_year
-                st.session_state['materiality_overall'] = overall_use
+                base_amt = pd.to_numeric(d.get('turnover_debit', 0), errors='coerce').fillna(0).abs() + pd.to_numeric(d.get('turnover_credit', 0), errors='coerce').fillna(0).abs()
+            total_base = base_amt.sum()
+            d['materiality_base'] = base_amt
+            d['materiality_alloc'] = np.where(total_base > 0, total_mat * base_amt / total_base, 0)
+            st.session_state['materiality_done'] = True
+            st.session_state['materiality_result'] = d
+            st.session_state['materiality_basis_used'] = basis_option
 
     if st.session_state.get('materiality_done', False):
-        mat_df = st.session_state.get('materiality_df', pd.DataFrame())
-        selected_year = st.session_state.get('materiality_year', selected_year)
-        overall_use = st.session_state.get('materiality_overall', overall)
-        if mat_df is None or mat_df.empty:
-            st.warning("⚠️ Материаллаг байдлын үр дүн хоосон байна.")
-        else:
-            st.markdown("### Материаллаг байдлын хуваарилалт")
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Нийт материаллаг байдал", f"₮{overall_use:,.0f}")
-            m2.metric("Гүйцэтгэлийн материаллаг", f"₮{overall_use * perf_ratio:,.0f}")
-            m3.metric("Дансны тоо", f"{len(mat_df):,}")
+        d = st.session_state.get('materiality_result', pd.DataFrame()).copy()
+        basis_option = st.session_state.get('materiality_basis_used', basis_option)
+        if not d.empty:
+            total_alloc = float(pd.to_numeric(d['materiality_alloc'], errors='coerce').fillna(0).sum())
+            top_n = int(min(10, len(d)))
+            k1, k2, k3 = st.columns(3)
+            k1.metric('Нийт данс', f'{len(d):,}')
+            k2.metric('Нийт хуваарилсан дүн', f'{total_alloc:,.2f}')
+            k3.metric('Суурь', basis_option)
 
-            query = st.text_input("Данс хайх", key='materiality_query')
-            show_df = mat_df.copy()
-            if query:
-                q = query.lower().strip()
-                show_df = show_df[
-                    show_df.iloc[:,0].astype(str).str.lower().str.contains(q, na=False) |
-                    show_df.iloc[:,1].astype(str).str.lower().str.contains(q, na=False)
-                ]
+            show_cols = [c for c in ['year','account_code','account_name','materiality_base','materiality_alloc','closing_debit','closing_credit','turnover_debit','turnover_credit'] if c in d.columns]
+            d_show = d[show_cols].sort_values('materiality_alloc', ascending=False)
+            st.markdown('#### 📋 Материаллаг байдлын хуваарилалт')
+            st.caption('Доорх хүснэгт нь данс бүрт оногдсон материаллаг байдлын дүнг харуулна.')
+            st.dataframe(d_show, use_container_width=True, hide_index=True)
+            _show_dataframe_download(d_show, 'materiality_by_account.csv')
 
-            st.dataframe(show_df, use_container_width=True, hide_index=True)
-
-            if not show_df.empty:
-                fig = px.bar(
-                    show_df.head(20),
-                    x='Дансны код',
-                    y='Зөвшөөрөгдөх алдаа ₮',
-                    hover_data=['Дансны нэр','Ангилал','Эрсдэлийн түвшин','Аудитын горим (ISA 330)'],
-                    title='Материаллаг байдлын хуваарилалт — өндөр ач холбогдолтой 20 данс'
-                )
-                st.plotly_chart(fig, use_container_width=True)
-
-            out = io.BytesIO()
-            with pd.ExcelWriter(out, engine='openpyxl') as w:
-                mat_df.to_excel(w, sheet_name='Материаллаг_байдал', index=False)
-            out.seek(0)
-            st.download_button(
-                "📥 Материаллаг байдлын тооцоо татах",
-                data=out.getvalue(),
-                file_name=f"materiality_accounts_{selected_year if selected_year is not None else 'all'}.xlsx",
-                mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-            )
+            try:
+                top_plot = d_show.head(top_n).copy()
+                fig_mat = px.bar(top_plot.sort_values('materiality_alloc', ascending=True), x='materiality_alloc', y='account_code', orientation='h', title='Top accounts by materiality allocation')
+                fig_mat.update_layout(height=420, xaxis_title='Материаллаг дүн', yaxis_title='Данс')
+                st.plotly_chart(fig_mat, use_container_width=True)
+            except Exception:
+                pass
