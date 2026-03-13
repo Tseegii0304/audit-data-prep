@@ -20,7 +20,6 @@ from sklearn.model_selection import StratifiedKFold, cross_val_predict
 from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_score, roc_curve
 import warnings, io, re, gzip, zipfile
 from datetime import datetime
-from pathlib import Path
 from collections import Counter
 warnings.filterwarnings('ignore')
 from tab_descriptions import TabDescriptions
@@ -1713,107 +1712,27 @@ elif page.startswith("2"):
         ml_df = st.session_state.get('tb_ml_df', pd.DataFrame())
         fi = st.session_state.get('tb_feature_importance', pd.DataFrame())
 
-        years_available = []
-        if isinstance(tb_stats, dict) and tb_stats:
-            years_available = sorted(tb_stats.keys())
-        elif not ml_df.empty and 'year' in ml_df.columns:
-            years_available = sorted(pd.to_numeric(ml_df['year'], errors='coerce').dropna().astype(int).unique().tolist())
-
-        selected_year = None
-        if years_available:
-            default_idx = len(years_available) - 1
-            selected_year = st.selectbox('📅 TB аномали шинжилгээний он', years_available, index=default_idx, key='tb_year_selector_v52')
-
-        st.markdown("""
-        ### 📘 TB шинжилгээний тайлбар
-        Энд дансны түвшний AI шинжилгээг табуудаар харуулна.
-
-        - **🤖 TB аномали**: данс тус бүрийн хэвийн бус хөдөлгөөн
-        - **🔎 TB XAI**: эрсдэлийг тайлбарлаж буй гол feature-үүд
-        - **📋 Part1 эрсдэлийн матриц**: сар-данс-харилцагчийн эрсдэлийн нэгтгэл
-        - **📈 Сарын хандлага**: дебит, кредитийн сарын динамик
-        """)
-
-        tab1, tab2, tab3, tab4 = st.tabs(['🤖 TB аномали', '🔎 TB XAI / Feature importance', '📋 Part1 эрсдэлийн матриц', '📈 Сарын хандлага'])
-
-        with tab1:
-            if tb_stats:
-                rows = [{'Он': yr, 'Данс': vals.get('accounts', 0), 'Дебит эргэлт': vals.get('turnover_d', 0), 'Кредит эргэлт': vals.get('turnover_c', 0)} for yr, vals in sorted(tb_stats.items())]
-                st.markdown('#### 📊 TB summary')
-                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
-            if not ml_df.empty:
-                ml_show = ml_df.copy()
-                if selected_year is not None and 'year' in ml_show.columns:
-                    ml_show = ml_show[pd.to_numeric(ml_show['year'], errors='coerce') == int(selected_year)].copy()
-
-                total_accounts = len(ml_show)
-                total_anomaly = int(ml_show['ensemble_anomaly'].sum()) if 'ensemble_anomaly' in ml_show.columns else 0
-                anomaly_rate = (total_anomaly / total_accounts * 100) if total_accounts else 0
-
-                m1, m2, m3 = st.columns(3)
-                m1.metric('Нийт данс', f'{total_accounts:,}')
-                m2.metric('Аномали данс', f'{total_anomaly:,}')
-                m3.metric('Аномалийн хувь', f'{anomaly_rate:.1f}%')
-
-                st.markdown(f'#### 🤖 {selected_year if selected_year is not None else "Бүх он"} TB аномали шинжилгээ')
-                st.caption('Isolation Forest, Z-score, Turnover ratio, Ensemble аномалийг нэгтгэн харуулав.')
-                show_cols = [c for c in ['year','account_code','account_name','iso_anomaly','zscore_anomaly','turn_anomaly','ensemble_anomaly'] if c in ml_show.columns]
-                sort_cols = ['ensemble_anomaly', 'year'] if 'year' in ml_show.columns else ['ensemble_anomaly']
-                ascending = [False, True] if 'year' in ml_show.columns else [False]
-                st.dataframe(ml_show.sort_values(sort_cols, ascending=ascending)[show_cols].head(1000), use_container_width=True, hide_index=True)
-                _show_dataframe_download(ml_show, f'tb_anomaly_results_{selected_year if selected_year is not None else "all"}.csv')
-            else:
-                st.info('TB аномали шинжилгээний үр дүн хараахан үүсээгүй байна.')
-
-        with tab2:
-            st.markdown('#### 🔎 TB XAI / Feature importance')
-            st.caption('Энэ хэсэгт AI систем ямар үзүүлэлтээр дансыг эрсдэлтэй гэж үнэлснийг харуулна.')
-            if not fi.empty:
-                st.dataframe(fi, use_container_width=True, hide_index=True)
-                try:
-                    fig_fi = px.bar(fi.sort_values('importance', ascending=True), x='importance', y='feature', orientation='h', title='TB Feature importance')
-                    fig_fi.update_layout(height=420, yaxis_title='Feature', xaxis_title='Importance')
-                    st.plotly_chart(fig_fi, use_container_width=True)
-                except Exception:
-                    pass
-            else:
-                st.info('Feature importance одоогоор байхгүй байна.')
-
-        with tab3:
-            st.markdown('#### 📋 Part1 эрсдэлийн матриц')
-            st.caption('Сар, данс, харилцагчийн түвшинд том дүн болон өндөр давтамжийн эрсдэлийг харуулна.')
-            if not rm_all.empty:
-                rm_show = rm_all.copy()
-                if selected_year is not None and 'year' in rm_show.columns:
-                    rm_show = rm_show[pd.to_numeric(rm_show['year'], errors='coerce') == int(selected_year)].copy()
-                st.dataframe(rm_show.head(1000), use_container_width=True, hide_index=True)
-                _show_dataframe_download(rm_show, f'part1_risk_matrix_{selected_year if selected_year is not None else "all"}.csv')
-            else:
-                st.info('Part1 эрсдэлийн матриц олдсонгүй.')
-
-        with tab4:
-            st.markdown('#### 📈 Сарын хандлага')
-            st.caption('TB/Part1-ээс үүссэн сарын хөдөлгөөнийг интерактив байдлаар харуулна.')
-            if not mo_all.empty and 'month' in mo_all.columns:
-                mo_plot = mo_all.copy()
-                if selected_year is not None and 'year' in mo_plot.columns:
-                    mo_plot = mo_plot[pd.to_numeric(mo_plot['year'], errors='coerce') == int(selected_year)].copy()
-
-                value_options = [c for c in ['total_debit_mnt', 'total_credit_mnt', 'ending_balance_mnt', 'transaction_count'] if c in mo_plot.columns]
-                if value_options:
-                    selected_metric = st.selectbox('📌 Сарын үзүүлэлт', value_options, key='tb_month_metric_v52')
-                    mo_plot[selected_metric] = pd.to_numeric(mo_plot[selected_metric], errors='coerce').fillna(0)
-                    color_arg = 'account_code' if 'account_code' in mo_plot.columns and mo_plot['account_code'].nunique() <= 15 else None
-                    fig_mo = px.line(mo_plot.sort_values('month'), x='month', y=selected_metric, color=color_arg, markers=True, title=f'Сарын хандлага — {selected_metric}')
-                    fig_mo.update_layout(height=460, xaxis_title='Сар', yaxis_title=selected_metric)
-                    st.plotly_chart(fig_mo, use_container_width=True)
-                    st.dataframe(mo_plot.head(500), use_container_width=True, hide_index=True)
-                    _show_dataframe_download(mo_plot, f'monthly_trend_{selected_year if selected_year is not None else "all"}.csv')
-                else:
-                    st.info('Сарын хандлагын тоон баганууд олдсонгүй.')
-            else:
-                st.info('Сарын хандлагын өгөгдөл олдсонгүй.')
+        if tb_stats:
+            rows = [{'Он': yr, 'Данс': vals.get('accounts', 0), 'Дебит эргэлт': vals.get('turnover_d', 0), 'Кредит эргэлт': vals.get('turnover_c', 0)} for yr, vals in sorted(tb_stats.items())]
+            st.markdown('### 📊 TB summary')
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        if not ml_df.empty:
+            st.markdown('### 🤖 TB аномали шинжилгээ')
+            show_cols = [c for c in ['year','account_code','account_name','iso_anomaly','zscore_anomaly','turn_anomaly','ensemble_anomaly'] if c in ml_df.columns]
+            st.dataframe(ml_df.sort_values(['ensemble_anomaly','year'], ascending=[False, True])[show_cols].head(500), use_container_width=True, hide_index=True)
+            _show_dataframe_download(ml_df, 'tb_anomaly_results.csv')
+        if not fi.empty:
+            st.markdown('### 🔎 TB XAI / Feature importance')
+            st.dataframe(fi, use_container_width=True, hide_index=True)
+        if not rm_all.empty:
+            st.markdown('### 📋 Part1 эрсдэлийн матриц')
+            st.dataframe(rm_all.head(300), use_container_width=True, hide_index=True)
+        if not mo_all.empty and 'month' in mo_all.columns and 'total_debit_mnt' in mo_all.columns:
+            st.markdown('### 📈 Сарын хандлага')
+            mo_plot = mo_all.copy()
+            mo_plot['total_debit_mnt'] = pd.to_numeric(mo_plot['total_debit_mnt'], errors='coerce').fillna(0)
+            fig_mo = px.line(mo_plot, x='month', y='total_debit_mnt', color='year' if 'year' in mo_plot.columns else None, title='Сарын дебит хөдөлгөөн')
+            st.plotly_chart(fig_mo, use_container_width=True)
     else:
         st.info('👆 Энд шууд файл оруулах эсвэл 1️⃣ цэсэнд бэлтгэсэн TB/Part1 файлаа ашиглаад шинжилгээг эхлүүлнэ үү.')
 
@@ -1924,14 +1843,7 @@ elif page.startswith("3"):
 
 else:
     st.header("4️⃣ Материаллаг байдлын тооцоо")
-    st.markdown("""
-    ### 📐 Материаллаг байдлын интерактив тооцоо
-    Энэ хэсэг нь TB өгөгдөл дээр суурилан материаллаг байдлыг данс бүрт хуваарилна.
-
-    - **Суурь дүн**: хаалтын үлдэгдэл эсвэл эргэлтийн дүн
-    - **Нийт материаллаг байдал**: таны оруулсан босго дүн
-    - **Хуваарилалт**: дансны жинлэлтийн дагуу автоматаар тооцоолно
-    """)
+    st.markdown("TB файл дээр суурилсан материаллаг байдлын хуваарилалт.")
 
     mat_files = st.file_uploader("📎 Нэмэлт TB файл оруулах", type=['xlsx'], accept_multiple_files=True, key='mat_files_work')
     tb_inputs = _cache_files('prepared_tb_cache')
@@ -1946,52 +1858,16 @@ else:
                 bio = io.BytesIO(buf.getvalue()); bio.name = f'TB_standardized_{year}_{Path(f.name).stem}.xlsx'
                 tb_inputs.append(bio)
 
-    cmat1, cmat2 = st.columns(2)
-    with cmat1:
-        total_mat = st.number_input('Нийт материаллаг байдлын дүн', min_value=0.0, value=float(st.session_state.get('materiality_total_input', 1000000.0)), step=100000.0)
-    with cmat2:
-        basis_option = st.selectbox('📊 Хуваарилалтын суурь', ['Хаалтын үлдэгдэл', 'Эргэлтийн нийлбэр'], key='materiality_basis_v52')
-    st.session_state['materiality_total_input'] = total_mat
-
+    total_mat = st.number_input('Нийт материаллаг байдлын дүн', min_value=0.0, value=1000000.0, step=100000.0)
     if st.button('📐 Материаллаг байдлыг тооцоолох', type='primary', use_container_width=True):
         tb_all, _ = load_tb(tb_inputs) if tb_inputs else (pd.DataFrame(), {})
         if tb_all.empty:
             st.warning('TB өгөгдөл олдсонгүй.')
         else:
             d = tb_all.copy()
-            if basis_option == 'Хаалтын үлдэгдэл':
-                base_amt = pd.to_numeric(d.get('closing_debit', 0), errors='coerce').fillna(0).abs() + pd.to_numeric(d.get('closing_credit', 0), errors='coerce').fillna(0).abs()
-            else:
-                base_amt = pd.to_numeric(d.get('turnover_debit', 0), errors='coerce').fillna(0).abs() + pd.to_numeric(d.get('turnover_credit', 0), errors='coerce').fillna(0).abs()
+            base_amt = d['closing_debit'].abs() + d['closing_credit'].abs() if 'closing_debit' in d.columns else d['turnover_debit'].abs() + d['turnover_credit'].abs()
             total_base = base_amt.sum()
-            d['materiality_base'] = base_amt
             d['materiality_alloc'] = np.where(total_base > 0, total_mat * base_amt / total_base, 0)
-            st.session_state['materiality_done'] = True
-            st.session_state['materiality_result'] = d
-            st.session_state['materiality_basis_used'] = basis_option
-
-    if st.session_state.get('materiality_done', False):
-        d = st.session_state.get('materiality_result', pd.DataFrame()).copy()
-        basis_option = st.session_state.get('materiality_basis_used', basis_option)
-        if not d.empty:
-            total_alloc = float(pd.to_numeric(d['materiality_alloc'], errors='coerce').fillna(0).sum())
-            top_n = int(min(10, len(d)))
-            k1, k2, k3 = st.columns(3)
-            k1.metric('Нийт данс', f'{len(d):,}')
-            k2.metric('Нийт хуваарилсан дүн', f'{total_alloc:,.2f}')
-            k3.metric('Суурь', basis_option)
-
-            show_cols = [c for c in ['year','account_code','account_name','materiality_base','materiality_alloc','closing_debit','closing_credit','turnover_debit','turnover_credit'] if c in d.columns]
-            d_show = d[show_cols].sort_values('materiality_alloc', ascending=False)
-            st.markdown('#### 📋 Материаллаг байдлын хуваарилалт')
-            st.caption('Доорх хүснэгт нь данс бүрт оногдсон материаллаг байдлын дүнг харуулна.')
-            st.dataframe(d_show, use_container_width=True, hide_index=True)
-            _show_dataframe_download(d_show, 'materiality_by_account.csv')
-
-            try:
-                top_plot = d_show.head(top_n).copy()
-                fig_mat = px.bar(top_plot.sort_values('materiality_alloc', ascending=True), x='materiality_alloc', y='account_code', orientation='h', title='Top accounts by materiality allocation')
-                fig_mat.update_layout(height=420, xaxis_title='Материаллаг дүн', yaxis_title='Данс')
-                st.plotly_chart(fig_mat, use_container_width=True)
-            except Exception:
-                pass
+            show_cols = [c for c in ['year','account_code','account_name','closing_debit','closing_credit','turnover_debit','turnover_credit','materiality_alloc'] if c in d.columns]
+            st.dataframe(d[show_cols].sort_values('materiality_alloc', ascending=False), use_container_width=True, hide_index=True)
+            _show_dataframe_download(d[show_cols], 'materiality_by_account.csv')
