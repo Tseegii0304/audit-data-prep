@@ -1,8 +1,9 @@
 """
-Аудитын эрсдэл илрүүлэх хиймэл оюуны систем v5.1
+Аудитын эрсдэл илрүүлэх хиймэл оюуны систем v6.0
 TB + Ledger + Part1 + ML + XAI → Тусдаа шинжилгээний цэс
 pip install streamlit pandas numpy scikit-learn plotly openpyxl shap
 streamlit run audit_app.py
+# v6.0 trial: статистик шинжилгээ + journal progress + session reuse
 """
 import streamlit as st
 import pandas as pd
@@ -11,12 +12,13 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from sklearn.ensemble import IsolationForest, RandomForestClassifier, GradientBoostingClassifier
-from sklearn.linear_model import LogisticRegression
+from sklearn.linear_model import LogisticRegression, LinearRegression
 from sklearn.neighbors import LocalOutlierFactor
 from sklearn.svm import OneClassSVM
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.model_selection import StratifiedKFold, cross_val_predict
+from sklearn.decomposition import PCA
 from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_score, roc_curve
 from sklearn.linear_model import Ridge, Lasso, ElasticNet
 from scipy import stats
@@ -29,6 +31,7 @@ except Exception:
 import warnings, io, re, gzip, zipfile
 from datetime import datetime
 from collections import Counter
+from pathlib import Path
 warnings.filterwarnings('ignore')
 from tab_descriptions import TabDescriptions
 try:
@@ -37,7 +40,7 @@ except Exception:
     shap = None
 
 td = TabDescriptions()
-st.set_page_config(page_title="Аудитын эрсдэл илрүүлэх систем v5.1", page_icon="🔍", layout="wide")
+st.set_page_config(page_title="Аудитын эрсдэл илрүүлэх систем v6.0", page_icon="🔍", layout="wide")
 st.markdown('<h1 style="text-align:center;color:#1565c0">🔍 Аудитын эрсдэл илрүүлэх хиймэл оюуны систем</h1>', unsafe_allow_html=True)
 st.markdown('<p style="text-align:center;color:#666;font-size:14px">Гүйлгээ-баланс + Ерөнхий журнал → Дансны болон гүйлгээний түвшний эрсдэл илрүүлэлт • Материаллаг байдлын тооцоо</p>', unsafe_allow_html=True)
 
@@ -50,380 +53,12 @@ SESSION_DEFAULTS = {
     'journal_detected_rows': [],
     'tb_upload_cache': {},
     'journal_upload_cache': {},
+    'account_name_map': {},
+    'account_master_df': pd.DataFrame(),
 }
 for _k, _v in SESSION_DEFAULTS.items():
     if _k not in st.session_state:
         st.session_state[_k] = _v
-
-
-# ── UI / progress helpers ──
-def _init_progress_ui():
-    title_box = st.empty()
-    bar = st.progress(0)
-    detail_box = st.empty()
-    return title_box, bar, detail_box
-
-def _update_progress(title_box, bar, detail_box, pct, title, detail=''):
-    try:
-        title_box.markdown(f"### 🔄 {title}")
-        bar.progress(int(max(0, min(100, pct))))
-        if detail:
-            detail_box.info(detail)
-    except Exception:
-        pass
-
-def _finish_progress(title_box, bar, detail_box, msg='✅ Дууслаа'):
-    try:
-        title_box.markdown("### ✅ Процесс дууслаа")
-        bar.progress(100)
-        detail_box.success(msg)
-    except Exception:
-        pass
-
-def _show_info_box(title, body, kind='info'):
-    if kind == 'success':
-        st.success(f"**{title}**\n\n{body}")
-    elif kind == 'warning':
-        st.warning(f"**{title}**\n\n{body}")
-    else:
-        st.info(f"**{title}**\n\n{body}")
-
-ISA_GUIDE = pd.DataFrame([
-    {'Стандарт':'ISA 315','Монгол тайлбар':'Эрсдэлийг тодорхойлох ба үнэлэх','Системд ашиглах':'TB болон Journal эрсдэлийн шинжилгээ, risk matrix'},
-    {'Стандарт':'ISA 320','Монгол тайлбар':'Материаллаг байдал','Системд ашиглах':'Материаллаг байдлын хуваарилалт'},
-    {'Стандарт':'ISA 330','Монгол тайлбар':'Үнэлсэн эрсдэлд хариу өгөх аудитын горим','Системд ашиглах':'Өндөр эрсдэлтэй данс/гүйлгээнд нарийвчилсан шалгалт'},
-    {'Стандарт':'ISA 500','Монгол тайлбар':'Аудитын нотолгоо','Системд ашиглах':'Тайлбаргүй, ховор, зөрчилтэй гүйлгээний шалгалт'},
-    {'Стандарт':'ISA 520','Монгол тайлбар':'Аналитик горим','Системд ашиглах':'Хугацааны цуваа, тренд, хазайлтын шинжилгээ'},
-    {'Стандарт':'ISA 530','Монгол тайлбар':'Аудитын дээжлэл','Системд ашиглах':'Sampling тайлбар, AI sample-aware journal analysis'},
-    {'Стандарт':'ISA 540','Монгол тайлбар':'Тооцооллын үнэлгээ','Системд ашиглах':'Regression, trend, expectation analysis'},
-    {'Стандарт':'ISSAI 100/200','Монгол тайлбар':'Төрийн аудитын суурь зарчим','Системд ашиглах':'Compliance тайлбар ба аудиторын дүгнэлт'}
-])
-
-REG_MODEL_NAMES_MN = {
-    'Linear Regression':'Шугаман регресс',
-    'Ridge':'Ridge регресс',
-    'Lasso':'Lasso регресс',
-    'Elastic Net':'Elastic Net регресс',
-    'Logistic Regression':'Логистик регресс'
-}
-
-def _safe_numeric_df(df):
-    if df is None or df.empty:
-        return pd.DataFrame()
-    d = df.copy()
-    if 'amount' not in d.columns and {'debit_mnt','credit_mnt'}.issubset(d.columns):
-        d['amount'] = pd.to_numeric(d['debit_mnt'], errors='coerce').fillna(0).abs() + pd.to_numeric(d['credit_mnt'], errors='coerce').fillna(0).abs()
-    if 'month' not in d.columns and 'transaction_date' in d.columns:
-        dt = pd.to_datetime(d['transaction_date'], errors='coerce')
-        d['month'] = dt.dt.to_period('M').astype(str)
-    num = d.select_dtypes(include=[np.number]).copy()
-    for c in d.columns:
-        if c not in num.columns:
-            s = pd.to_numeric(d[c], errors='coerce')
-            if s.notna().sum() > max(10, int(len(d) * 0.2)):
-                num[c] = s
-    num = num.replace([np.inf, -np.inf], np.nan).dropna(axis=1, how='all')
-    return num
-
-def _build_time_series_df(source_name, tb_df=None, mo_df=None, journal_df=None):
-    if source_name == 'TB':
-        if mo_df is not None and not mo_df.empty and {'month','total_debit_mnt','total_credit_mnt'}.issubset(mo_df.columns):
-            out = mo_df.copy()
-            out['Огноо'] = pd.to_datetime(out['month'].astype(str) + '-01', errors='coerce')
-            out['Нийт дүн'] = pd.to_numeric(out['total_debit_mnt'], errors='coerce').fillna(0) + pd.to_numeric(out['total_credit_mnt'], errors='coerce').fillna(0)
-            return out[['Огноо','Нийт дүн']].dropna()
-        if tb_df is not None and not tb_df.empty and 'year' in tb_df.columns:
-            g = tb_df.groupby('year').agg(Нийт_дүн=('turnover_debit','sum')).reset_index()
-            g['Огноо'] = pd.to_datetime(g['year'].astype(str) + '-12-31', errors='coerce')
-            g['Нийт дүн'] = g['Нийт_дүн']
-            return g[['Огноо','Нийт дүн']]
-    else:
-        if journal_df is not None and not journal_df.empty:
-            j = journal_df.copy()
-            if 'amount' not in j.columns and {'debit_mnt','credit_mnt'}.issubset(j.columns):
-                j['amount'] = pd.to_numeric(j['debit_mnt'], errors='coerce').fillna(0).abs() + pd.to_numeric(j['credit_mnt'], errors='coerce').fillna(0).abs()
-            if 'transaction_date' in j.columns:
-                j['Огноо'] = pd.to_datetime(j['transaction_date'], errors='coerce')
-                out = j.dropna(subset=['Огноо']).groupby(pd.Grouper(key='Огноо', freq='M')).agg(**{'Нийт дүн':('amount','sum'),'Гүйлгээний тоо':('amount','count')}).reset_index()
-                return out
-    return pd.DataFrame()
-
-def _interpret_correlation(val):
-    aval = abs(float(val))
-    if aval >= 0.8:
-        return 'маш хүчтэй хамаарал'
-    if aval >= 0.5:
-        return 'дунд зэрэг хамаарал'
-    if aval >= 0.3:
-        return 'сул-дунд хамаарал'
-    return 'сул хамаарал'
-
-def _interpret_r2(r2):
-    try:
-        r2 = float(r2)
-    except Exception:
-        return 'R² тодорхойгүй.'
-    if r2 >= 0.7:
-        return 'Загварын тайлбарлах чадвар өндөр байна.'
-    if r2 >= 0.4:
-        return 'Загварын тайлбарлах чадвар дунд түвшинд байна.'
-    return 'Загварын тайлбарлах чадвар сул байна.'
-
-def _regression_summary(y, X):
-    work = pd.concat([y.rename('Y'), X], axis=1).replace([np.inf, -np.inf], np.nan).dropna()
-    if work.empty or len(X.columns) == 0:
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-    y_col = 'Y'
-    x_cols = list(X.columns)
-    Xmat = work[x_cols].astype(float)
-    yvec = work[y_col].astype(float)
-    model = LinearRegression().fit(Xmat, yvec)
-    pred = model.predict(Xmat)
-    score = model.score(Xmat, yvec)
-    coef_df = pd.DataFrame({'Хувьсагч': x_cols, 'Коэффициент': model.coef_}).sort_values('Коэффициент', key=lambda s: s.abs(), ascending=False)
-    fit_df = pd.DataFrame({'Бодит': yvec, 'Таамагласан': pred})
-    summary = pd.DataFrame([{'R²': score, 'Мөрийн тоо': len(work), 'Хамаарах хувьсагч': y_col, 'Тайлбарлагч хувьсагчийн тоо': len(x_cols), 'Тайлбар': _interpret_r2(score)}])
-    return summary, coef_df, fit_df
-
-def _render_statistics_page():
-    st.header('4️⃣ Статистик шинжилгээ')
-    st.markdown('Аудитад зориулсан **Statistical Lab**: тодорхойлох статистик, тархалт, стандарт хазайлт, хамаарал, бүх регрессүүд, хугацааны цуваа, олон хувьсагчийн шинжилгээ, хэт хазайлт, статистик тестүүдийг хийнэ.')
-    st.caption('Энэ цэс нь бэлтгэсэн файлуудыг дахин ашиглана. Том journal файл дээр бүх мөрийг биш, төлөөлөх sample ашиглаж хурдыг сайжруулна.')
-    _show_info_box('Аудитын аналитик горим', 'ISA 520 стандартын дагуу тренд, харьцаа, зөрүү, хүлээлтийн шинжилгээг энэ хэсэгт хийж болно. Өндөр эрсдэлтэй үр дүн гарвал ISA 330-ийн дагуу substantive procedure санал болгоно.')
-
-    source_name = st.radio('Эх сурвалж сонгох', ['TB', 'Ерөнхий журнал'], horizontal=True, key='stats_source_pick')
-    sample_size = st.slider('Journal sample хэмжээ', 10000, 120000, 40000, 5000, key='stats_sample_size')
-
-    if st.button('📊 Статистик шинжилгээг шинэчлэх', type='primary', use_container_width=True, key='run_stats_page'):
-        try:
-            title_box, prog, detail = _init_progress_ui()
-            _update_progress(title_box, prog, detail, 5, 'Статистик шинжилгээ эхэллээ', 'Эх өгөгдлийг session-оос уншиж байна...')
-            tb_df = st.session_state.get('tb_all', pd.DataFrame())
-            mo_df = st.session_state.get('mo_all', pd.DataFrame())
-            journal_df = st.session_state.get('journal_ml_result', pd.DataFrame())
-
-            if source_name == 'TB':
-                if tb_df is None or tb_df.empty:
-                    tb_inputs = _cache_files('prepared_tb_cache')
-                    tb_df, _ = load_tb(tb_inputs)
-                _update_progress(title_box, prog, detail, 30, 'TB тоон өгөгдлийг бэлдэж байна', 'TB тоон багануудыг цэвэрлэж байна...')
-                src_df = tb_df.copy()
-                num_df = _safe_numeric_df(tb_df)
-                ts_df = _build_time_series_df('TB', tb_df=tb_df, mo_df=mo_df)
-            else:
-                if journal_df is None or journal_df.empty:
-                    led_inputs = _cache_files('prepared_ledger_cache')
-                    _, journal_df = load_ledger_stats(led_inputs, sample_per_year=sample_size, chunksize=100000)
-                _update_progress(title_box, prog, detail, 30, 'Journal sample бэлдэж байна', f'Sample хэмжээ: {sample_size:,}')
-                src_df = journal_df.copy()
-                num_df = _safe_numeric_df(journal_df)
-                ts_df = _build_time_series_df('Journal', journal_df=journal_df)
-
-            if src_df is None or src_df.empty or num_df.empty:
-                raise ValueError('Статистик шинжилгээ хийхэд хангалттай өгөгдөл олдсонгүй.')
-
-            _update_progress(title_box, prog, detail, 55, 'Тодорхойлох статистик ба хамаарлыг тооцож байна', 'Mean, std, correlation, distribution...')
-            desc_df = pd.DataFrame({
-                'Дундаж': num_df.mean(),
-                'Медиан': num_df.median(),
-                'Std хазайлт': num_df.std(),
-                'Дисперс': num_df.var(),
-                'Skew': num_df.skew(),
-                'Kurtosis': num_df.kurt(),
-                'Min': num_df.min(),
-                'Max': num_df.max()
-            }).reset_index().rename(columns={'index':'Хувьсагч'})
-            corr_p = num_df.corr(method='pearson')
-            corr_s = num_df.corr(method='spearman')
-            _update_progress(title_box, prog, detail, 75, 'Регресс, PCA, outlier тестүүдийг бэлдэж байна', 'Regression, PCA, Z-score, IQR, normality tests...')
-            # choose target
-            y_col = 'amount' if 'amount' in num_df.columns else num_df.columns[-1]
-            x_cols = [c for c in num_df.columns if c != y_col][:min(8, max(1, len(num_df.columns)-1))]
-            reg_summary, reg_coef, reg_fit = _regression_summary(num_df[y_col], num_df[x_cols]) if x_cols else (pd.DataFrame(), pd.DataFrame(), pd.DataFrame())
-            z_col = y_col
-            z_series = ((num_df[z_col] - num_df[z_col].mean()) / (num_df[z_col].std() if num_df[z_col].std() else 1))
-            q1, q3 = num_df[z_col].quantile([0.25, 0.75])
-            iqr = q3 - q1
-            outlier_df = pd.DataFrame({
-                'Утга': num_df[z_col],
-                'Z-оноо': z_series,
-                'Z>3': z_series.abs() > 3,
-                'IQR outlier': (num_df[z_col] < q1 - 1.5*iqr) | (num_df[z_col] > q3 + 1.5*iqr)
-            })
-            tests = []
-            try:
-                samp = num_df[z_col].dropna().sample(min(len(num_df[z_col].dropna()), 5000), random_state=42)
-                sh_stat, sh_p = stats.shapiro(samp)
-                tests.append({'Тест':'Shapiro-Wilk','Statistic':sh_stat,'p-value':sh_p,'Тайлбар':'p<0.05 бол нормаль тархалт биш байж болзошгүй'})
-            except Exception:
-                pass
-            try:
-                ks_stat, ks_p = stats.kstest(((samp - samp.mean()) / (samp.std() if samp.std() else 1)), 'norm')
-                tests.append({'Тест':'Kolmogorov-Smirnov','Statistic':ks_stat,'p-value':ks_p,'Тайлбар':'Нормаль тархалтын зөрүүг шалгана'})
-            except Exception:
-                pass
-            pca_df = pd.DataFrame()
-            pca_var = pd.DataFrame()
-            if len(num_df.columns) >= 2:
-                Xsc = StandardScaler().fit_transform(num_df.fillna(0))
-                pca = PCA(n_components=2)
-                comps = pca.fit_transform(Xsc)
-                pca_df = pd.DataFrame({'PC1': comps[:,0], 'PC2': comps[:,1]})
-                pca_var = pd.DataFrame({'Бүрэлдэхүүн':['PC1','PC2'], 'Тайлбарлах чадвар': pca.explained_variance_ratio_})
-            _update_progress(title_box, prog, detail, 95, 'График ба үр дүнгийн тайлбарыг бэлдэж байна', 'UI-г шинэчилж байна...')
-            st.session_state['stats_ready'] = True
-            st.session_state['stats_source_name'] = source_name
-            st.session_state['stats_src_df'] = src_df
-            st.session_state['stats_num_df'] = num_df
-            st.session_state['stats_desc_df'] = desc_df
-            st.session_state['stats_corr_p'] = corr_p
-            st.session_state['stats_corr_s'] = corr_s
-            st.session_state['stats_reg_summary'] = reg_summary
-            st.session_state['stats_reg_coef'] = reg_coef
-            st.session_state['stats_reg_fit'] = reg_fit
-            st.session_state['stats_ts_df'] = ts_df
-            st.session_state['stats_outlier_df'] = outlier_df
-            st.session_state['stats_tests_df'] = pd.DataFrame(tests)
-            st.session_state['stats_pca_df'] = pca_df
-            st.session_state['stats_pca_var'] = pca_var
-            _finish_progress(title_box, prog, detail, 'Статистик шинжилгээ амжилттай дууслаа.')
-        except Exception as e:
-            st.exception(e)
-
-    if st.session_state.get('stats_ready'):
-        desc_df = st.session_state.get('stats_desc_df', pd.DataFrame())
-        corr_p = st.session_state.get('stats_corr_p', pd.DataFrame())
-        corr_s = st.session_state.get('stats_corr_s', pd.DataFrame())
-        reg_summary = st.session_state.get('stats_reg_summary', pd.DataFrame())
-        reg_coef = st.session_state.get('stats_reg_coef', pd.DataFrame())
-        reg_fit = st.session_state.get('stats_reg_fit', pd.DataFrame())
-        ts_df = st.session_state.get('stats_ts_df', pd.DataFrame())
-        outlier_df = st.session_state.get('stats_outlier_df', pd.DataFrame())
-        tests_df = st.session_state.get('stats_tests_df', pd.DataFrame())
-        pca_df = st.session_state.get('stats_pca_df', pd.DataFrame())
-        pca_var = st.session_state.get('stats_pca_var', pd.DataFrame())
-
-        tabs = st.tabs([
-            '📊 Тодорхойлох статистик',
-            '📉 Тархалтын шинжилгээ',
-            '🔗 Хамаарлын шинжилгээ',
-            '📈 Регрессийн загварууд',
-            '⏱ Хугацааны цуваа',
-            '🧠 Олон хувьсагчийн шинжилгээ',
-            '🚨 Хэт хазайлтын илрүүлэлт',
-            '🧪 Статистик тестүүд',
-            '📚 Аудитын стандарт ба горим'
-        ])
-
-        with tabs[0]:
-            st.dataframe(desc_df, use_container_width=True, hide_index=True)
-            metric_col = st.selectbox('Дүрслэх хувьсагч', list(st.session_state['stats_num_df'].columns), key='stats_metric_col')
-            fig_h = px.histogram(st.session_state['stats_num_df'], x=metric_col, nbins=40, title=f'{metric_col} тархалт')
-            st.plotly_chart(fig_h, use_container_width=True)
-            _show_info_box('Тайлбар', 'Дундаж, медиан, стандарт хазайлт, skew, kurtosis нь өгөгдлийн хэлбэрийг тайлбарлана. Std өндөр бол хэлбэлзэл их, skew өндөр бол тэгш бус тархалттай.')
-
-        with tabs[1]:
-            dist_col = st.selectbox('Тархалт шалгах хувьсагч', list(st.session_state['stats_num_df'].columns), key='stats_dist_col')
-            fig_box = px.box(st.session_state['stats_num_df'], y=dist_col, points='outliers', title=f'{dist_col} boxplot')
-            st.plotly_chart(fig_box, use_container_width=True)
-            _show_info_box('Тайлбар', 'Boxplot дээрх алслагдсан цэгүүд нь хэт хазайлтын эхний дохио байж болно. Аудитын хувьд unusual transaction эсэхийг баримтаар шалгана.')
-
-        with tabs[2]:
-            corr_method = st.radio('Корреляцийн арга', ['Pearson', 'Spearman'], horizontal=True, key='corr_method_view')
-            corr_view = corr_p if corr_method == 'Pearson' else corr_s
-            st.dataframe(corr_view, use_container_width=True)
-            fig_corr = px.imshow(corr_view, text_auto='.2f', aspect='auto', title=f'{corr_method} correlation matrix')
-            st.plotly_chart(fig_corr, use_container_width=True)
-            if corr_view.shape[0] >= 2:
-                pairs = []
-                cols = list(corr_view.columns)
-                for i in range(len(cols)):
-                    for j in range(i+1, len(cols)):
-                        pairs.append((cols[i], cols[j], corr_view.iloc[i, j]))
-                pairs = sorted(pairs, key=lambda x: abs(float(x[2])), reverse=True)[:5]
-                pair_df = pd.DataFrame([{'Хос 1':a, 'Хос 2':b, 'Коэффициент':v, 'Тайлбар':_interpret_correlation(v)} for a,b,v in pairs])
-                st.dataframe(pair_df, use_container_width=True, hide_index=True)
-
-        with tabs[3]:
-            reg_tabs = st.tabs(['Шугаман регресс', 'Ridge регресс', 'Lasso регресс', 'Elastic Net регресс', 'Логистик регресс', 'Dashboard'])
-            y_col = 'amount' if 'amount' in st.session_state['stats_num_df'].columns else st.session_state['stats_num_df'].columns[-1]
-            x_cols = [c for c in st.session_state['stats_num_df'].columns if c != y_col][:min(8, max(1, len(st.session_state['stats_num_df'].columns)-1))]
-            X = st.session_state['stats_num_df'][x_cols].fillna(0) if x_cols else pd.DataFrame()
-            y = st.session_state['stats_num_df'][y_col].fillna(0)
-            with reg_tabs[0]:
-                st.dataframe(reg_summary, use_container_width=True, hide_index=True)
-                st.dataframe(reg_coef, use_container_width=True, hide_index=True)
-            with reg_tabs[1]:
-                if not X.empty:
-                    model = Ridge(alpha=1.0).fit(X, y)
-                    st.dataframe(pd.DataFrame({'Хувьсагч':x_cols,'Коэффициент':model.coef_}), use_container_width=True, hide_index=True)
-            with reg_tabs[2]:
-                if not X.empty:
-                    model = Lasso(alpha=max(float(np.std(y))*0.001, 0.001), max_iter=5000).fit(X, y)
-                    st.dataframe(pd.DataFrame({'Хувьсагч':x_cols,'Коэффициент':model.coef_}), use_container_width=True, hide_index=True)
-            with reg_tabs[3]:
-                if not X.empty:
-                    model = ElasticNet(alpha=max(float(np.std(y))*0.001, 0.001), l1_ratio=0.5, max_iter=5000).fit(X, y)
-                    st.dataframe(pd.DataFrame({'Хувьсагч':x_cols,'Коэффициент':model.coef_}), use_container_width=True, hide_index=True)
-            with reg_tabs[4]:
-                if not X.empty:
-                    try:
-                        y_bin = (y > y.median()).astype(int)
-                        model = LogisticRegression(max_iter=2000).fit(X, y_bin)
-                        st.dataframe(pd.DataFrame({'Хувьсагч':x_cols,'Коэффициент':model.coef_[0]}), use_container_width=True, hide_index=True)
-                    except Exception as e:
-                        st.warning(f'Логистик регресс ажиллуулж чадсангүй: {e}')
-            with reg_tabs[5]:
-                if not reg_fit.empty:
-                    fig_fit = px.scatter(reg_fit.sample(min(len(reg_fit), 5000), random_state=42), x='Бодит', y='Таамагласан', title='Бодит ба таамагласан утгын харьцуулалт')
-                    st.plotly_chart(fig_fit, use_container_width=True)
-                    if not reg_summary.empty:
-                        _show_info_box('Регрессийн тайлбар', str(reg_summary.iloc[0]['Тайлбар']))
-
-        with tabs[4]:
-            if ts_df is not None and not ts_df.empty and 'Огноо' in ts_df.columns and 'Нийт дүн' in ts_df.columns:
-                fig_ts = px.line(ts_df, x='Огноо', y='Нийт дүн', title='Хугацааны цувааны үндсэн график')
-                st.plotly_chart(fig_ts, use_container_width=True)
-                ts_work = ts_df.copy().sort_values('Огноо')
-                ts_work['3-сарын хөдөлгөөнт дундаж'] = ts_work['Нийт дүн'].rolling(3).mean()
-                fig_ma = px.line(ts_work, x='Огноо', y=['Нийт дүн','3-сарын хөдөлгөөнт дундаж'], title='Хөдөлгөөнт дундаж')
-                st.plotly_chart(fig_ma, use_container_width=True)
-                if seasonal_decompose is not None and len(ts_work) >= 12:
-                    try:
-                        decomp = seasonal_decompose(ts_work['Нийт дүн'].fillna(0), model='additive', period=max(2, min(12, len(ts_work)//2)))
-                        de_df = pd.DataFrame({'Огноо':ts_work['Огноо'],'Trend':decomp.trend,'Seasonal':decomp.seasonal,'Residual':decomp.resid}).dropna()
-                        fig_dec = px.line(de_df, x='Огноо', y=['Trend','Seasonal','Residual'], title='Seasonal decomposition')
-                        st.plotly_chart(fig_dec, use_container_width=True)
-                    except Exception:
-                        pass
-                _show_info_box('Тайлбар', 'Хугацааны цуваа нь улирлын нөлөө, сарын эцсийн өсөлт, огцом хэлбэлзлийг шалгахад ашиглагдана. ISA 520 аналитик процедуртай нийцнэ.')
-            else:
-                st.info('Хугацааны цуваанд хангалттай огнооны өгөгдөл олдсонгүй.')
-
-        with tabs[5]:
-            if not pca_df.empty:
-                fig_pca = px.scatter(pca_df.sample(min(len(pca_df), 5000), random_state=42), x='PC1', y='PC2', title='PCA 2D дүрслэл')
-                st.plotly_chart(fig_pca, use_container_width=True)
-                st.dataframe(pca_var, use_container_width=True, hide_index=True)
-                _show_info_box('Тайлбар', 'PCA нь олон хувьсагчийн өгөгдлийн бүтцийг хоёр үндсэн тэнхлэг дээр буулгана. Бүлгээс хэт хол байрласан цэгүүд нь нэмэлт шалгалтын дохио байж болно.')
-
-        with tabs[6]:
-            st.dataframe(outlier_df.head(3000), use_container_width=True, hide_index=True)
-            fig_out = px.scatter(outlier_df.reset_index().head(5000), x='index', y='Утга', color='Z>3', title='Хэт хазайлтын дүрслэл (Z-score)')
-            st.plotly_chart(fig_out, use_container_width=True)
-            _show_info_box('Тайлбар', 'Z>3 болон IQR outlier мөрүүдийг journal / TB дээр баримтаар шалгана. Энэ нь ISA 240, ISA 500-тэй холбоотой.')
-
-        with tabs[7]:
-            st.dataframe(tests_df, use_container_width=True, hide_index=True)
-            _show_info_box('Тайлбар', 'Нормаль тархалтын тест, t-test, ANOVA зэрэг нь хүлээгдэж буй зан төлөвөөс зөрж байгаа эсэхийг тоон байдлаар шалгана.')
-
-        with tabs[8]:
-            st.dataframe(ISA_GUIDE, use_container_width=True, hide_index=True)
-            st.markdown('### 🎯 Аудитын горимын санал')
-            st.markdown("""- **Өндөр хамаарал / өндөр хазайлт**: аналитик горимыг substantive procedure-оор баталгаажуулах
-- **Хэт хазайлт / anomaly**: баримтын шалгалт, дэлгэрэнгүй журналаар шалгах
-- **Жилийн эцсийн огцом өөрчлөлт**: cut-off, subsequent event, management override шалгах
-- **Regression / expectation зөрүү**: удирдлагын тайлбар ба нотолгоо шаардах""")
 
 def uploaded_files_to_cache(files):
     cache = {}
@@ -446,10 +81,69 @@ def cache_to_file_objects(cache):
 
 with st.sidebar:
     st.header("📌 Системийн цэс")
-    page = st.radio("Үндсэн цэс:", ["1️⃣ Өгөгдөл оруулах, бэлтгэх", "2️⃣ Гүйлгээ балансын шинжилгээ", "3️⃣ Ерөнхий журналын шинжилгээ", "4️⃣ Материаллаг байдлын тооцоо"])
+    page = st.radio("Үндсэн цэс:", ["1️⃣ Өгөгдөл оруулах, бэлтгэх", "2️⃣ Гүйлгээ балансын шинжилгээ", "3️⃣ Ерөнхий журналын шинжилгээ", "4️⃣ Статистик шинжилгээ", "5️⃣ Материаллаг байдлын тооцоо"])
 
 ACCT_RE_B = re.compile(r'Данс:\s*\[([^\]]+)\]\s*(.*)')
 ACCT_RE_P = re.compile(r'Данс:\s*(\d{3}-\d{2}-\d{2}-\d{3})\s+(.*)')
+
+
+
+FEATURE_LABELS_TB = {
+    'log_turn_d': 'Дебит эргэлтийн логарифм',
+    'log_turn_c': 'Кредит эргэлтийн логарифм',
+    'log_close_d': 'Дебит хаалтын үлдэгдлийн логарифм',
+    'log_close_c': 'Кредит хаалтын үлдэгдлийн логарифм',
+    'log_abs_change': 'Өөрчлөлтийн абсолют логарифм',
+    'cat_num': 'Дансны ангиллын кодчилол',
+    'turn_ratio': 'Дебит/кредит эргэлтийн харьцаа',
+    'growth_rate': 'Өсөлтийн хурд',
+    'year': 'Тайлант он',
+}
+FEATURE_LABELS_JOURNAL = {
+    'log_amount': 'Гүйлгээний дүнгийн логарифм',
+    'acct_cat_num': 'Дансны ангиллын кодчилол',
+    'benford_dev': 'Бенфордын хазайлт',
+    'is_round': 'Тэгш тоон дүн эсэх',
+    'amt_zscore': 'Данс доторх z-оноо',
+    'cp_rare': 'Ховор харилцагч',
+    'pair_rare': 'Ховор данс-харилцагч хос',
+    'desc_empty': 'Тайлбар хоосон эсэх',
+    'is_month_end': 'Сарын эцсийн огноо',
+    'is_year_end': 'Жилийн эцсийн огноо',
+    'is_dup': 'Давхардсан гүйлгээ',
+    'is_debit': 'Дебит талын бичилт',
+    'desc_mismatch': 'Тайлбар-дансны логик зөрчил',
+    'name_no_overlap': 'Дансны нэртэй үгийн давхцалгүй',
+    'dir_mismatch': 'Дебит/кредит чиглэлийн зөрчил',
+}
+ALGORITHM_DETAILS = pd.DataFrame([
+    {'Алгоритм':'Isolation Forest','Монгол тайлбар':'Олон модон тусгаарлалтаар бусдаас онцгой мөрийг олдог аномали алгоритм.','Ашиглалт':'Хэвийн бус данс, хэвийн бус гүйлгээ илрүүлэлт','Давуу тал':'Шошгогүй өгөгдөл дээр сайн ажиллана; хурдан','Анхаарах зүйл':'Contamination хувь хэт өндөр байвал хэт олон аномали гарч болно'},
+    {'Алгоритм':'Z-score','Монгол тайлбар':'Дундаж ба стандарт хазайлтаас хэдэн нэгж зайтай байгааг хэмждэг статистик арга.','Ашиглалт':'Хэт их дүн, хэт хэлбэлзэлтэй мөр шалгах','Давуу тал':'Ойлгоход амар; тайлбарлахад хялбар','Анхаарах зүйл':'Тархалт гажсан үед дангаараа хангалтгүй'},
+    {'Алгоритм':'Turn ratio','Монгол тайлбар':'Дебит ба кредитийн эргэлтийн харьцаа хэвийн түвшнээс зөрсөн эсэхийг шалгана.','Ашиглалт':'TB дээр бүтцийн гаж өөрчлөлт илрүүлэх','Давуу тал':'Дансны зан төлөвийн өөрчлөлтийг сайн харуулна','Анхаарах зүйл':'Кредит 0 үед харьцааг болгоомжтой тайлбарлана'},
+    {'Алгоритм':'Local Outlier Factor','Монгол тайлбар':'Ойр хөршүүдтэйгээ харьцуулахад хэт сийрэг байрласан мөрийг олдог.','Ашиглалт':'Журналын локал аномали илрүүлэх','Давуу тал':'Бүлэг доторх гаж мөрийг сайн барина','Анхаарах зүйл':'Хөршийн тоо бага/их сонговол мэдрэмж өөрчлөгдөнө'},
+    {'Алгоритм':'One-Class SVM','Монгол тайлбар':'Хэвийн мужийг сурч аваад түүнээс гадуурх мөрийг аномали гэж үздэг.','Ашиглалт':'Нарийн хилтэй аномали хайх','Давуу тал':'Нелинейр хэв шинж барина','Анхаарах зүйл':'Их өгөгдөл дээр удааширч болно'},
+    {'Алгоритм':'KMeans distance','Монгол тайлбар':'Кластерын төвөөс хол байрласан мөрийг эрсдэлтэй гэж үзнэ.','Ашиглалт':'Бүлэглэлд суурилсан ерөнхий аномали','Давуу тал':'Тайлбарлахад ойлгомжтой','Анхаарах зүйл':'Кластерын тоо буруу байвал чанар муудна'},
+    {'Алгоритм':'Ensemble ≥2 votes','Монгол тайлбар':'Олон алгоритмын санал нийлсэн мөрийг илүү өндөр эрсдэлтэй гэж ангилна.','Ашиглалт':'Journal AI-ийн эцсийн эрсдэлийн оноо','Давуу тал':'Нэг аргын алдааг бууруулна','Анхаарах зүйл':'Бүх аргын чанараас хамаарна'},
+])
+
+def localize_feature_name(name, context='tb'):
+    maps = FEATURE_LABELS_TB if context == 'tb' else FEATURE_LABELS_JOURNAL
+    return maps.get(str(name), str(name))
+
+def localize_feature_df(df, context='tb'):
+    if df is None or df.empty:
+        return df
+    d = df.copy()
+    if 'feature' in d.columns:
+        d['feature'] = d['feature'].map(lambda x: localize_feature_name(x, context))
+    if 'xai_top_feature' in d.columns:
+        d['xai_top_feature'] = d['xai_top_feature'].map(lambda x: localize_feature_name(x, context) if str(x) not in ('', 'nan', 'None') else '')
+    return d
+
+def _df_to_gz_csv_bytes(df):
+    raw = df.to_csv(index=False).encode('utf-8-sig')
+    return gzip.compress(raw)
+
 
 def parse_account(text):
     m = ACCT_RE_B.match(text)
@@ -549,7 +243,7 @@ def _auto_map(headers):
             if _match_col(h, f): m[f]=i; used.add(i); break
     return m
 
-def _find_header_row(all_rows, max_scan=12):
+def _find_header_row(all_rows, max_scan=30):
     """Гарчигын мөрийг автоматаар хайна."""
     best_i, best_s = 0, 0
     for i, row in enumerate(all_rows[:max_scan]):
@@ -632,7 +326,7 @@ def process_edt(file_obj, report_year):
         all_rows = []
         for i, row in enumerate(ws.iter_rows(values_only=True)):
             all_rows.append(list(row))
-            if i >= 1500: break
+            if i >= 5000: break
         if not all_rows: return pd.DataFrame(columns=EDT_COLUMNS), 0
         hdr_i, hdr_score = _find_header_row(all_rows)
         if hdr_score < 3: return pd.DataFrame(columns=EDT_COLUMNS), 0
@@ -673,7 +367,7 @@ def process_edt(file_obj, report_year):
         all_rows = []
         for i, row in enumerate(ws.iter_rows(values_only=True)):
             all_rows.append(list(row))
-            if i >= 1500: break
+            if i >= 5000: break
         if not all_rows: return pd.DataFrame(columns=EDT_COLUMNS), 0
         hdr_i, hdr_score = _find_header_row(all_rows)
         if hdr_score < 3: return pd.DataFrame(columns=EDT_COLUMNS), 0
@@ -721,7 +415,7 @@ def process_edt(file_obj, report_year):
         all_rows = []
         for i, row in enumerate(ws.iter_rows(values_only=True)):
             all_rows.append(list(row))
-            if i >= 3000: break
+            if i >= 10000: break
         if len(all_rows) < 10:
             return pd.DataFrame(columns=EDT_COLUMNS), 0
 
@@ -817,9 +511,6 @@ def process_edt(file_obj, report_year):
                     continue
                 if cnt_try > best_cnt:
                     best_df, best_cnt = df_try, cnt_try
-                if cnt_try > 50:
-                    wb.close()
-                    return df_try, cnt_try
         wb.close()
         return best_df, best_cnt
     except Exception:
@@ -1047,29 +738,6 @@ def load_part1(files):
     rm_all = pd.concat(all_rm, ignore_index=True) if all_rm else pd.DataFrame()
     mo_all = pd.concat(all_mo, ignore_index=True) if all_mo else pd.DataFrame()
     return rm_all, mo_all
-
-
-def _fast_read_journal_input(typ, f, year, max_rows=60000, chunksize=100000):
-    """Journal/ledger-г хурдан sample горимоор уншина."""
-    if typ == 'ledger':
-        try:
-            f.seek(0)
-            stats_j, sample_df = load_ledger_stats([f], sample_per_year=max_rows, chunksize=chunksize)
-            meta = list(stats_j.values())[0] if stats_j else {}
-            return sample_df.copy(), {'rows': int(meta.get('rows', 0)), 'accounts': int(meta.get('accounts', 0)), 'sample_rows': len(sample_df), 'mode': 'chunk_sample'}
-        except Exception:
-            f.seek(0)
-            led_df = read_ledger(f)
-            if len(led_df) > max_rows:
-                led_df = led_df.sample(max_rows, random_state=42)
-            return led_df.copy(), {'rows': len(led_df), 'accounts': led_df.get('account_code', pd.Series(dtype=str)).astype(str).nunique(), 'sample_rows': len(led_df), 'mode': 'fallback'}
-    if typ == 'edt':
-        f.seek(0)
-        edt_df, cnt = process_edt(f, year)
-        if len(edt_df) > max_rows:
-            edt_df = edt_df.sample(max_rows, random_state=42)
-        return edt_df.copy(), {'rows': int(cnt), 'accounts': edt_df.get('account_code', pd.Series(dtype=str)).astype(str).nunique() if not edt_df.empty else 0, 'sample_rows': len(edt_df), 'mode': 'parsed_sample'}
-    return pd.DataFrame(), {'rows':0,'accounts':0,'sample_rows':0,'mode':'none'}
 
 def clean_for_risk(df):
     """NaN / хоосон утгыг цэвэрлэж, эрсдэлийн шинжилгээнд бэлтгэнэ."""
@@ -1712,30 +1380,71 @@ def detect_file_type(f):
         return 'unknown', year
 
 
+
 def parse_account_names(file_obj):
     """Дансны код + нэрийн лавлах файл уншина.
-    Формат: A баганад дансны код (1, 31, 312, 3121, 31213, ...), B баганад нэр.
-    Санхүүгийн байдлын тайлан (СТ-1А) эсвэл дансны жагсаалт файл дэмжинэ.
+    Олон sheet-тэй дансны жагсаалт, СТ-1А, эсвэл 2-3 баганатай код/нэрийн лавлах файлыг дэмжинэ.
     """
     import openpyxl
     try:
         file_obj.seek(0)
         wb = openpyxl.load_workbook(file_obj, read_only=True, data_only=True)
-        ws = wb[wb.sheetnames[0]]
         code_map = {}
-        for row in ws.iter_rows(values_only=True):
-            c0 = str(row[0]).strip() if row[0] is not None else ''
-            c1 = str(row[1]).strip() if len(row) > 1 and row[1] is not None else ''
-            if not c0 or not c1:
-                continue
-            # Зөвхөн тоон код авах (1, 31, 312, 3121, 31213, ...)
-            c0_clean = re.sub(r'[^0-9]', '', c0)
-            if c0_clean and len(c0_clean) >= 1:
-                code_map[c0_clean] = c1.strip()
+        for sname in wb.sheetnames:
+            ws = wb[sname]
+            for row in ws.iter_rows(values_only=True):
+                vals = ["" if v is None else str(v).strip() for v in row[:4]]
+                low = " ".join(v.lower() for v in vals if v)
+                if not low or 'дансны код' in low or 'дансны нэр' in low:
+                    continue
+
+                candidates = []
+                if len(vals) >= 3:
+                    if vals[0]:
+                        candidates.append((vals[0], vals[2] or vals[1]))
+                    if vals[1]:
+                        candidates.append((vals[1], vals[2] or vals[0]))
+                elif len(vals) >= 2:
+                    candidates.append((vals[0], vals[1]))
+
+                for raw_code, raw_name in candidates:
+                    code_clean = re.sub(r'[^0-9]', '', str(raw_code))
+                    name_clean = str(raw_name).strip()
+                    if not code_clean or len(code_clean) < 2 or not name_clean:
+                        continue
+                    if name_clean.isdigit():
+                        continue
+                    code_map[code_clean] = name_clean
         wb.close()
+        file_obj.seek(0)
         return code_map
     except Exception:
+        try:
+            file_obj.seek(0)
+        except Exception:
+            pass
         return {}
+
+def build_account_master_df(code_map):
+    if not code_map:
+        return pd.DataFrame(columns=['account_code', 'account_name', 'code_len'])
+    master = pd.DataFrame(
+        [{'account_code': k, 'account_name': v, 'code_len': len(str(k))} for k, v in code_map.items()]
+    ).drop_duplicates(subset=['account_code']).sort_values(['code_len', 'account_code'], ascending=[False, True])
+    return master.reset_index(drop=True)
+
+def detect_account_from_master(code, code_map):
+    code_str = re.sub(r'[^0-9]', '', str(code))
+    if not code_str or not code_map:
+        return '', ''
+    for length in range(len(code_str), 1, -1):
+        prefix = code_str[:length]
+        if prefix in code_map:
+            return prefix, code_map[prefix]
+    for prefix, name in sorted(code_map.items(), key=lambda kv: len(kv[0]), reverse=True):
+        if prefix and prefix in code_str:
+            return prefix, name
+    return '', ''
 
 def merge_account_names(df, code_map):
     """Гүйлгээний DataFrame-д дансны нэрийг prefix matching-аар нэгтгэнэ.
@@ -1879,7 +1588,7 @@ FILE_TYPE_LABELS = {
     'edt': ('📘 Ерөнхий журнал (ЕЖ)', 'Ерөнхий журналын гүйлгээ → стандарт CSV ledger болгон хөрвүүлнэ'),
     'tb_std': ('📊 TB_standardized', 'Стандартчилсан TB → шинжилгээнд бэлэн'),
     'ledger': ('📄 Ledger / CSV', 'Гүйлгээний дэлгэрэнгүй файл → journal шинжилгээнд бэлэн'),
-    'part1': ('📈 Part1', 'Сарын нэгтгэл + Эрсдэлийн матриц → TB шинжилгээнд бэлэн'),
+    'part1': ('📈 Part1', 'Сарын нэгтгэл + Эрсдэлийн матриц → Гүйлгээ балансын шинжилгээнд бэлэн'),
     'unknown': ('❓ Тодорхойгүй', 'Файлын төрлийг таних боломжгүй'),
 }
 
@@ -1911,8 +1620,6 @@ def _cache_files(cache_key):
 def _df_to_csv_bytes(df):
     return df.to_csv(index=False).encode('utf-8-sig')
 
-def _df_to_gz_csv_bytes(df):
-    return gzip.compress(_df_to_csv_bytes(df))
 
 
 def _df_to_excel_bytes(df_map):
@@ -1923,22 +1630,16 @@ def _df_to_excel_bytes(df_map):
     return buf.getvalue()
 
 
-def _prepare_from_uploaded(uploaded, acct_name_map=None, progress_ui=None):
+def _prepare_from_uploaded(uploaded, acct_name_map=None):
     detected_rows = []
     acct_name_map = acct_name_map or {}
-    title_box, bar, detail_box = progress_ui if progress_ui else (None, None, None)
-    total = max(len(uploaded or []), 1)
-    for idx, f in enumerate(uploaded or [], start=1):
+    for f in uploaded or []:
         try:
-            if progress_ui:
-                _update_progress(title_box, bar, detail_box, int((idx-1)/total*80)+5, "Өгөгдөл бэлтгэж байна", f"Файл таньж байна: {f.name} ({idx}/{total})")
             ftype, year = detect_file_type(f)
             f.seek(0)
             label, desc = FILE_TYPE_LABELS.get(ftype, FILE_TYPE_LABELS['unknown'])
             detected_rows.append({'Файл': f.name, 'Төрөл': label, 'Он': year, 'Тайлбар': desc})
             if ftype == 'raw_tb':
-                if progress_ui:
-                    _update_progress(title_box, bar, detail_box, int((idx-1)/total*80)+10, "TB файлыг стандарт болгож байна", f.name)
                 buf, tb_sum = process_raw_tb(f)
                 if tb_sum is not None and not tb_sum.empty:
                     _cache_add('prepared_tb_cache', f'TB_standardized_{year}.xlsx', buf.getvalue())
@@ -1948,9 +1649,15 @@ def _prepare_from_uploaded(uploaded, acct_name_map=None, progress_ui=None):
                 _cache_add('prepared_part1_cache', f.name, f.getvalue())
             elif ftype == 'ledger':
                 _cache_add('prepared_ledger_cache', f.name, f.getvalue())
+                try:
+                    f.seek(0)
+                    led_df = read_ledger(f)
+                    if not led_df.empty:
+                        _, _, _, rm, _ = generate_part1(led_df, year)
+                        mo = pd.read_excel(io.BytesIO(_df_to_excel_bytes({'tmp': rm})), sheet_name='tmp') if False else None
+                except Exception:
+                    pass
             elif ftype == 'edt':
-                if progress_ui:
-                    _update_progress(title_box, bar, detail_box, int((idx-1)/total*80)+10, "Ерөнхий журналыг ledger рүү хөрвүүлж байна", f.name)
                 f.seek(0)
                 edt_df, cnt = process_edt(f, year)
                 if acct_name_map and not edt_df.empty:
@@ -1963,15 +1670,11 @@ def _prepare_from_uploaded(uploaded, acct_name_map=None, progress_ui=None):
     st.session_state['prep_detected_rows'] = detected_rows
 
 
-def _build_part1_from_prepared_ledgers(progress_ui=None):
+def _build_part1_from_prepared_ledgers():
     ledger_files = _cache_files('prepared_ledger_cache')
     created = 0
-    title_box, bar, detail_box = progress_ui if progress_ui else (None, None, None)
-    total = max(len(ledger_files), 1)
-    for idx, lf in enumerate(ledger_files, start=1):
+    for lf in ledger_files:
         try:
-            if progress_ui:
-                _update_progress(title_box, bar, detail_box, 85 + int(idx/total*10), "Part1 файл үүсгэж байна", f"{lf.name} ({idx}/{total})")
             year = get_year(lf.name)
             lf.seek(0)
             led_df = read_ledger(lf)
@@ -1991,32 +1694,595 @@ def _render_downloads(title, cache_key, mime):
     if files:
         st.markdown(title)
         for name, raw in files.items():
-            st.download_button(f'📥 {name}', raw, file_name=name, mime=mime, key=f'dl_{cache_key}_{name}')
+            dl_mime = 'application/gzip' if str(name).endswith('.gz') else mime
+            st.download_button(f'📥 {name}', raw, file_name=name, mime=dl_mime, key=f'dl_{cache_key}_{name}')
 
 
-def _show_dataframe_download(df, filename, label='📥 CSV татах'):
+def _show_dataframe_download(df, filename, label='📥 GZ-шахсан CSV татах'):
     if df is not None and not df.empty:
-        st.download_button(label, _df_to_csv_bytes(df), file_name=filename, mime='text/csv', key=f'dl_{filename}')
+        out_name = filename if filename.endswith('.gz') else filename.replace('.csv', '.csv.gz')
+        st.download_button(label, _df_to_gz_csv_bytes(df), file_name=out_name, mime='application/gzip', key=f'dl_{out_name}')
 
+
+
+
+def _safe_numeric_df(df):
+    if df is None or df.empty:
+        return pd.DataFrame()
+    d = df.copy()
+    for c in d.columns:
+        if d[c].dtype == object:
+            try:
+                d[c] = pd.to_numeric(d[c], errors='ignore')
+            except Exception:
+                pass
+    num = d.select_dtypes(include=[np.number]).copy()
+    num = num.replace([np.inf, -np.inf], np.nan)
+    return num
+
+def _stats_descriptive(num_df):
+    if num_df is None or num_df.empty:
+        return pd.DataFrame()
+    desc = num_df.describe().T.reset_index().rename(columns={'index':'Үзүүлэлт','count':'Тоо','mean':'Дундаж','std':'Стандарт хазайлт','min':'Хамгийн бага','25%':'Q1','50%':'Медиан','75%':'Q3','max':'Хамгийн их'})
+    desc['Skewness'] = num_df.skew(numeric_only=True).values
+    desc['Kurtosis'] = num_df.kurt(numeric_only=True).values
+    return desc
+
+def _build_time_series_df(source_name, tb_df=None, mo_df=None, journal_df=None):
+    if source_name == 'TB':
+        if mo_df is not None and not mo_df.empty and 'month' in mo_df.columns:
+            metric_candidates = [c for c in ['total_debit_mnt','total_credit_mnt','transaction_count','ending_balance_mnt'] if c in mo_df.columns]
+            if metric_candidates:
+                out = mo_df.groupby('month')[metric_candidates].sum(numeric_only=True).reset_index().sort_values('month')
+                return out
+        if tb_df is not None and not tb_df.empty and 'year' in tb_df.columns:
+            out = tb_df.groupby('year')[['turnover_debit','turnover_credit','closing_balance_signed','net_change_signed']].sum(numeric_only=True).reset_index()
+            out['month'] = out['year'].astype(str)
+            return out
+    else:
+        if journal_df is not None and not journal_df.empty:
+            d = journal_df.copy()
+            if 'amount' not in d.columns and {'debit_mnt','credit_mnt'}.issubset(d.columns):
+                d['amount'] = pd.to_numeric(d['debit_mnt'], errors='coerce').fillna(0).abs() + pd.to_numeric(d['credit_mnt'], errors='coerce').fillna(0).abs()
+            if 'month' not in d.columns and 'transaction_date' in d.columns:
+                d['month'] = d['transaction_date'].astype(str).str[:7]
+            if 'month' in d.columns:
+                out = d.groupby('month').agg(Нийт_дүн=('amount','sum'), Гүйлгээний_тоо=('amount','count')).reset_index().sort_values('month')
+                return out.rename(columns={'month':'period'})
+    return pd.DataFrame()
+
+def _run_multiple_regression(df, y_col, x_cols):
+    if df is None or df.empty or not y_col or not x_cols:
+        return None, pd.DataFrame(), pd.DataFrame()
+    work = df[[y_col] + x_cols].copy().apply(pd.to_numeric, errors='coerce').dropna()
+    if work.empty or len(work) < max(8, len(x_cols)+2):
+        return None, pd.DataFrame(), pd.DataFrame()
+    X = work[x_cols]
+    y = work[y_col]
+    model = LinearRegression()
+    model.fit(X, y)
+    pred = model.predict(X)
+    score = model.score(X, y)
+    coef_df = pd.DataFrame({'Хувьсагч': x_cols, 'Коэффициент': model.coef_}).sort_values('Коэффициент', key=lambda s: s.abs(), ascending=False)
+    fit_df = pd.DataFrame({'Бодит': y, 'Таамагласан': pred})
+    summary = pd.DataFrame([{'R²': score, 'Мөрийн тоо': len(work), 'Хамаарах хувьсагч': y_col, 'Тайлбарлагч хувьсагчийн тоо': len(x_cols)}])
+    return summary, coef_df, fit_df
+
+def _render_statistics_page():
+    st.header('4️⃣ Статистик шинжилгээ')
+    st.markdown('TB болон Ерөнхий журналын бэлэн файлуудаас тодорхойлох статистик, стандарт хазайлт, хугацааны цуваа, корреляци, регресс, PCA шинжилгээ хийнэ.')
+    st.caption('Энэ цэс нь бэлтгэсэн файлуудыг дахин ашиглана. Том journal файл дээр бүх мөрийг биш, төлөөлөх sample ашиглаж хурдыг сайжруулна.')
+
+    source_name = st.radio('Эх сурвалж сонгох', ['TB', 'Ерөнхий журнал'], horizontal=True, key='stats_source_pick')
+    sample_size = st.slider('Journal sample хэмжээ', 10000, 120000, 40000, 5000, key='stats_sample_size')
+
+    if st.button('📊 Статистик шинжилгээг шинэчлэх', type='primary', use_container_width=True, key='run_stats_page'):
+        try:
+            stats_status = st.empty()
+            stats_prog = st.progress(0, text='Статистик шинжилгээ бэлдэж байна...')
+            tb_df = st.session_state.get('tb_all', pd.DataFrame())
+            mo_df = st.session_state.get('mo_all', pd.DataFrame())
+            journal_df = st.session_state.get('journal_ml_result', pd.DataFrame())
+
+            if source_name == 'TB':
+                stats_status.info('TB файлуудыг уншиж байна...')
+                if tb_df is None or tb_df.empty:
+                    tb_inputs = _cache_files('prepared_tb_cache')
+                    tb_df, _ = load_tb(tb_inputs)
+                stats_prog.progress(35, text='TB тоон өгөгдлийг бэлдэж байна...')
+                num_df = _safe_numeric_df(tb_df)
+                ts_df = _build_time_series_df('TB', tb_df=tb_df, mo_df=mo_df)
+                src_df = tb_df
+            else:
+                stats_status.info('Journal файлуудаас sample уншиж байна...')
+                if journal_df is None or journal_df.empty:
+                    led_inputs = _cache_files('prepared_ledger_cache')
+                    _, journal_df = load_ledger_stats(led_inputs, sample_per_year=sample_size, chunksize=100000)
+                    if journal_df is not None and not journal_df.empty and 'amount' not in journal_df.columns and {'debit_mnt','credit_mnt'}.issubset(journal_df.columns):
+                        journal_df['amount'] = pd.to_numeric(journal_df['debit_mnt'], errors='coerce').fillna(0).abs() + pd.to_numeric(journal_df['credit_mnt'], errors='coerce').fillna(0).abs()
+                stats_prog.progress(35, text='Journal sample дээр статистик шинжилгээний өгөгдөл бэлдэж байна...')
+                num_df = _safe_numeric_df(journal_df)
+                ts_df = _build_time_series_df('Journal', journal_df=journal_df)
+                src_df = journal_df
+
+            if num_df is None or num_df.empty:
+                raise ValueError('Статистик шинжилгээ хийх тоон өгөгдөл олдсонгүй.')
+
+            desc = _stats_descriptive(num_df)
+            corr = num_df.corr(numeric_only=True)
+            z_df = pd.DataFrame()
+            for c in num_df.columns[:30]:
+                s = pd.to_numeric(num_df[c], errors='coerce')
+                if s.std(ddof=0) and not np.isnan(s.std(ddof=0)):
+                    z = (s - s.mean()) / s.std(ddof=0)
+                    z_df = pd.concat([z_df, pd.DataFrame({'Үзүүлэлт': c, 'Утга': s, 'Z-оноо': z})], ignore_index=True)
+            pca_df = pd.DataFrame()
+            try:
+                pca_source = num_df.dropna()
+                if len(pca_source) >= 3 and pca_source.shape[1] >= 2:
+                    pca = PCA(n_components=2)
+                    comps = pca.fit_transform(StandardScaler().fit_transform(pca_source))
+                    pca_df = pd.DataFrame({'PC1': comps[:,0], 'PC2': comps[:,1]})
+            except Exception:
+                pca_df = pd.DataFrame()
+
+            st.session_state['stats_source_name'] = source_name
+            st.session_state['stats_src_df'] = src_df
+            st.session_state['stats_num_df'] = num_df
+            st.session_state['stats_desc'] = desc
+            st.session_state['stats_corr'] = corr
+            st.session_state['stats_ts'] = ts_df
+            st.session_state['stats_z'] = z_df
+            st.session_state['stats_pca'] = pca_df
+            stats_prog.progress(100, text='Статистик шинжилгээ бэлэн боллоо.')
+            stats_status.success('Статистик шинжилгээ амжилттай бэлэн боллоо.')
+        except Exception as e:
+            st.session_state['stats_error'] = str(e)
+            st.exception(e)
+
+    if st.session_state.get('stats_error'):
+        st.error(st.session_state['stats_error'])
+
+    if st.session_state.get('stats_desc') is not None and isinstance(st.session_state.get('stats_desc'), pd.DataFrame) and not st.session_state.get('stats_desc').empty:
+        src_df = st.session_state.get('stats_src_df', pd.DataFrame())
+        num_df = st.session_state.get('stats_num_df', pd.DataFrame())
+        desc = st.session_state.get('stats_desc', pd.DataFrame())
+        corr = st.session_state.get('stats_corr', pd.DataFrame())
+        ts_df = st.session_state.get('stats_ts', pd.DataFrame())
+        z_df = st.session_state.get('stats_z', pd.DataFrame())
+        pca_df = st.session_state.get('stats_pca', pd.DataFrame())
+        st.markdown(f"### Эх сурвалж: {st.session_state.get('stats_source_name', source_name)}")
+        t1, t2, t3, t4, t5, t6 = st.tabs(['📋 Тодорхойлох статистик','📏 Стандарт хазайлт','📈 Хугацааны цуваа','🧩 Корреляци','📉 Регресс','🧠 PCA'])
+
+        with t1:
+            st.caption('Дундаж, медиан, стандарт хазайлт, skewness, kurtosis зэрэг суурь статистикууд.')
+            st.dataframe(desc, use_container_width=True, hide_index=True)
+            view_cols = list(num_df.columns[:8])
+            if view_cols:
+                pick_col = st.selectbox('Тархалтын графикт үзүүлэх үзүүлэлт', view_cols, key='stats_hist_col')
+                fig_hist = px.histogram(src_df, x=pick_col, nbins=40, marginal='box', title=f'{pick_col} тархалт')
+                st.plotly_chart(fig_hist, use_container_width=True)
+            _show_dataframe_download(desc, 'descriptive_statistics.csv')
+
+        with t2:
+            st.caption('Z-оноогоор хэвийн бус статистик хазайлтыг шалгана. |Z| > 2.5 мөрүүдийг онцолж болно.')
+            if not z_df.empty:
+                zpick = st.selectbox('Z-оноо харах үзүүлэлт', sorted(z_df['Үзүүлэлт'].unique()), key='stats_zpick')
+                zview = z_df[z_df['Үзүүлэлт']==zpick].copy()
+                zview['Онцгой эсэх'] = np.where(zview['Z-оноо'].abs()>2.5, 'Тийм', 'Үгүй')
+                st.dataframe(zview.head(1000), use_container_width=True, hide_index=True)
+                fig_z = px.scatter(zview.reset_index(), x='index', y='Z-оноо', color='Онцгой эсэх', title=f'{zpick} – Z-онооны тархалт')
+                fig_z.add_hline(y=2.5, line_dash='dash')
+                fig_z.add_hline(y=-2.5, line_dash='dash')
+                st.plotly_chart(fig_z, use_container_width=True)
+            else:
+                st.info('Стандарт хазайлтын шинжилгээнд хангалттай өгөгдөл алга.')
+
+        with t3:
+            st.caption('Хугацааны өөрчлөлт, тренд, улирлын хэлбэлзлийг харахад ашиглана.')
+            if not ts_df.empty:
+                time_col = 'month' if 'month' in ts_df.columns else ('period' if 'period' in ts_df.columns else ts_df.columns[0])
+                y_opts = [c for c in ts_df.columns if c != time_col]
+                y_pick = st.selectbox('Хугацааны цувааны үзүүлэлт', y_opts, key='stats_ts_y')
+                fig_ts = px.line(ts_df, x=time_col, y=y_pick, markers=True, title=f'{y_pick} хугацааны цуваа')
+                st.plotly_chart(fig_ts, use_container_width=True)
+                st.dataframe(ts_df, use_container_width=True, hide_index=True)
+            else:
+                st.info('Хугацааны цувааны өгөгдөл олдсонгүй.')
+
+        with t4:
+            st.caption('Тоон хувьсагчдын хоорондын шугаман хамаарлыг корреляцийн матрицаар үзүүлнэ.')
+            if corr is not None and not corr.empty:
+                fig_corr = px.imshow(corr, text_auto='.2f', aspect='auto', title='Корреляцийн матриц')
+                st.plotly_chart(fig_corr, use_container_width=True)
+                st.dataframe(corr, use_container_width=True)
+            else:
+                st.info('Корреляцийн шинжилгээнд хангалттай тоон багана алга.')
+
+        with t5:
+            st.caption('Олон хувьсагчийн регрессээр сонгосон хамаарах хувьсагчид бусад үзүүлэлтүүд хэрхэн нөлөөлж байгааг харуулна.')
+            reg_cols = list(num_df.columns)
+            if len(reg_cols) >= 3:
+                y_col = st.selectbox('Хамаарах хувьсагч (Y)', reg_cols, key='stats_reg_y')
+                default_x = [c for c in reg_cols if c != y_col][:3]
+                x_cols = st.multiselect('Тайлбарлагч хувьсагчид (X)', [c for c in reg_cols if c != y_col], default=default_x, key='stats_reg_x')
+                if st.button('📉 Регресс ажиллуулах', key='stats_reg_run'):
+                    summary, coef_df, fit_df = _run_multiple_regression(num_df, y_col, x_cols)
+                    st.session_state['stats_reg_summary'] = summary
+                    st.session_state['stats_reg_coef'] = coef_df
+                    st.session_state['stats_reg_fit'] = fit_df
+                summary = st.session_state.get('stats_reg_summary', pd.DataFrame())
+                coef_df = st.session_state.get('stats_reg_coef', pd.DataFrame())
+                fit_df = st.session_state.get('stats_reg_fit', pd.DataFrame())
+                if summary is not None and not summary.empty:
+                    st.dataframe(summary, use_container_width=True, hide_index=True)
+                    st.dataframe(coef_df, use_container_width=True, hide_index=True)
+                    fig_coef = px.bar(coef_df, x='Коэффициент', y='Хувьсагч', orientation='h', title='Регрессийн коэффициент')
+                    st.plotly_chart(fig_coef, use_container_width=True)
+                    fig_fit = px.scatter(fit_df.reset_index(), x='Бодит', y='Таамагласан', title='Бодит vs Таамагласан')
+                    st.plotly_chart(fig_fit, use_container_width=True)
+            else:
+                st.info('Регресс хийхэд хангалттай тоон хувьсагч алга.')
+
+        with t6:
+            st.caption('PCA нь олон хувьсагчийг 2 үндсэн бүрэлдэхүүнд бууруулж, бүтэц ба гаж бүлэглэлийг харахад ашиглагдана.')
+            if pca_df is not None and not pca_df.empty:
+                fig_pca = px.scatter(pca_df, x='PC1', y='PC2', title='PCA – 2 хэмжээст дүрслэл')
+                st.plotly_chart(fig_pca, use_container_width=True)
+                st.dataframe(pca_df.head(1000), use_container_width=True, hide_index=True)
+            else:
+                st.info('PCA хийхэд хангалттай цэвэр тоон өгөгдөл алга.')
+
+
+
+def _pick_stats_source_df():
+    """Статистик шинжилгээнд ашиглах эх өгөгдлийг session-с сонгоно."""
+    candidates = []
+    tb_df = st.session_state.get('tb_all', pd.DataFrame())
+    if tb_df is not None and not tb_df.empty:
+        candidates.append(('TB', tb_df))
+    j_df = st.session_state.get('journal_ml_result', pd.DataFrame())
+    if j_df is not None and not j_df.empty:
+        candidates.append(('Journal ML', j_df))
+    # raw/sample ledger from prepared cache if available
+    prepared_ledger = _cache_files('prepared_ledger_cache')
+    if prepared_ledger:
+        try:
+            _, led_sample = load_ledger_stats(prepared_ledger, sample_per_year=30000, chunksize=100000)
+            if led_sample is not None and not led_sample.empty:
+                candidates.append(('Ledger sample', led_sample))
+        except Exception:
+            pass
+    if not candidates:
+        return None, pd.DataFrame()
+    labels = [x[0] for x in candidates]
+    choice = st.selectbox('📚 Статистикийн эх өгөгдөл', labels, key='stats_source_choice')
+    for lbl, df in candidates:
+        if lbl == choice:
+            return lbl, df.copy()
+    return candidates[0][0], candidates[0][1].copy()
+
+def _prepare_numeric_stats_df(df):
+    d = df.copy()
+    # common derived fields
+    if 'amount' not in d.columns and ('debit_mnt' in d.columns or 'credit_mnt' in d.columns):
+        d['amount'] = pd.to_numeric(d.get('debit_mnt', 0), errors='coerce').fillna(0).abs() + \
+                      pd.to_numeric(d.get('credit_mnt', 0), errors='coerce').fillna(0).abs()
+    if 'month' not in d.columns and 'transaction_date' in d.columns:
+        d['transaction_date'] = pd.to_datetime(d['transaction_date'], errors='coerce')
+        d['month'] = d['transaction_date'].dt.to_period('M').astype(str)
+    num = d.select_dtypes(include=[np.number]).copy()
+    # Add coercible numeric columns missed as object
+    for c in d.columns:
+        if c not in num.columns:
+            try:
+                s = pd.to_numeric(d[c], errors='coerce')
+                if s.notna().sum() > max(10, len(s) * 0.2):
+                    num[c] = s
+            except Exception:
+                pass
+    num = num.replace([np.inf, -np.inf], np.nan)
+    num = num.dropna(axis=1, how='all')
+    return d, num
+
+def _safe_regression(y, X):
+    try:
+        X2 = X.replace([np.inf, -np.inf], np.nan).fillna(0)
+        y2 = y.replace([np.inf, -np.inf], np.nan).fillna(0)
+        coef = np.linalg.lstsq(X2.values, y2.values, rcond=None)[0]
+        return pd.DataFrame({'Хувьсагч': X2.columns, 'Коэффициент': coef})
+    except Exception:
+        return pd.DataFrame(columns=['Хувьсагч','Коэффициент'])
+
+def _run_stats_lab():
+    st.header("4️⃣ Статистик шинжилгээ")
+    st.markdown("Аудитад зориулсан Statistical Lab — тодорхойлох статистик, тархалт, корреляци, регресс, хугацааны цуваа, PCA, outlier, статистик тестүүд.")
+
+    source_name, source_df = _pick_stats_source_df()
+    if source_df.empty:
+        st.info("👆 Эхлээд 1️⃣ цэсэнд өгөгдөл бэлтгэх эсвэл 2️⃣/3️⃣ цэсэнд шинжилгээг ажиллуулна уу.")
+        return
+
+    raw_df, num = _prepare_numeric_stats_df(source_df)
+    if num.empty:
+        st.warning('Статистик шинжилгээ хийх тоон өгөгдөл олдсонгүй.')
+        return
+
+    st.caption(f"Эх өгөгдөл: {source_name} • Мөр: {len(raw_df):,} • Тоон багана: {len(num.columns)}")
+
+    tabs = st.tabs([
+        "📊 Descriptive",
+        "📉 Distribution",
+        "🔗 Correlation",
+        "📈 Regression models",
+        "⏱ Time series",
+        "🧠 Multivariate",
+        "🚨 Outlier",
+        "🧪 Statistical tests"
+    ])
+
+    # 1 Descriptive
+    with tabs[0]:
+        st.markdown("### 📊 Тодорхойлох статистик")
+        desc = pd.DataFrame({
+            'Дундаж': num.mean(),
+            'Медиан': num.median(),
+            'Std хазайлт': num.std(),
+            'Дисперс': num.var(),
+            'Схазайлтын хэлбэр (Skew)': num.skew(),
+            'Оргиллог (Kurtosis)': num.kurt(),
+            'Min': num.min(),
+            'Max': num.max(),
+            'NA бус мөр': num.count()
+        }).reset_index().rename(columns={'index':'Хувьсагч'})
+        st.dataframe(desc, use_container_width=True, hide_index=True)
+        metric_col = st.selectbox('Histogram хувьсагч', list(num.columns), key='stats_hist_col')
+        fig = px.histogram(num, x=metric_col, nbins=50, title=f'{metric_col} тархалт')
+        st.plotly_chart(fig, use_container_width=True)
+        box = px.box(num, y=metric_col, points='outliers', title=f'{metric_col} boxplot')
+        st.plotly_chart(box, use_container_width=True)
+
+    # 2 Distribution
+    with tabs[1]:
+        st.markdown("### 📉 Тархалтын шинжилгээ")
+        dist_col = st.selectbox('Тархалт шалгах хувьсагч', list(num.columns), key='dist_col')
+        s = num[dist_col].dropna()
+        fig = px.histogram(s, x=dist_col, marginal='violin', nbins=40, title=f'{dist_col} тархалтын дүрслэл')
+        st.plotly_chart(fig, use_container_width=True)
+        try:
+            shapiro_stat, shapiro_p = stats.shapiro(s.sample(min(len(s), 5000), random_state=42))
+        except Exception:
+            shapiro_stat, shapiro_p = np.nan, np.nan
+        try:
+            ks_stat, ks_p = stats.kstest((s - s.mean()) / (s.std() if s.std() else 1), 'norm')
+        except Exception:
+            ks_stat, ks_p = np.nan, np.nan
+        st.dataframe(pd.DataFrame([
+            {'Тест':'Shapiro-Wilk', 'Statistic':shapiro_stat, 'p-value':shapiro_p},
+            {'Тест':'Kolmogorov-Smirnov', 'Statistic':ks_stat, 'p-value':ks_p},
+        ]), use_container_width=True, hide_index=True)
+        if 'amount' in raw_df.columns:
+            ben = raw_df['amount'].dropna()
+            ben = ben[ben > 0]
+            if not ben.empty:
+                first_digits = ben.astype(int).astype(str).str[0]
+                obs = first_digits.value_counts(normalize=True).sort_index()
+                benford_exp = pd.Series({1:0.301,2:0.176,3:0.125,4:0.097,5:0.079,6:0.067,7:0.058,8:0.051,9:0.046})
+                ben_df = pd.DataFrame({'digit': benford_exp.index, 'Observed': [obs.get(str(i), 0) for i in benford_exp.index], 'Benford expected': benford_exp.values})
+                figb = px.bar(ben_df.melt(id_vars='digit', var_name='Төрөл', value_name='Хувь'), x='digit', y='Хувь', color='Төрөл', barmode='group', title='Бенфордын харьцуулалт')
+                st.plotly_chart(figb, use_container_width=True)
+
+    # 3 Correlation
+    with tabs[2]:
+        st.markdown("### 🔗 Корреляцийн шинжилгээ")
+        method = st.selectbox('Корреляцийн арга', ['pearson', 'spearman', 'kendall'], key='corr_method')
+        corr = num.corr(method=method)
+        st.dataframe(corr, use_container_width=True)
+        figc = px.imshow(corr, text_auto='.2f', title=f'{method.title()} correlation matrix', aspect='auto')
+        st.plotly_chart(figc, use_container_width=True)
+
+    # 4 Regression models
+    with tabs[3]:
+        st.markdown("### 📈 Regression models")
+        target = st.selectbox('Зорилтот хувьсагч (Y)', list(num.columns), key='reg_target')
+        features = st.multiselect('Тайлбарлагч хувьсагчууд (X)', [c for c in num.columns if c != target], default=[c for c in num.columns if c != target][:min(5, max(1, len(num.columns)-1))], key='reg_features')
+        if features:
+            y = num[target].fillna(0)
+            X = num[features].fillna(0)
+            reg_tabs = st.tabs(['Linear Regression', 'Ridge', 'Lasso', 'Elastic Net', 'Logistic (binary target)', 'Dashboard'])
+            with reg_tabs[0]:
+                coef_df = _safe_regression(y, X)
+                st.dataframe(coef_df, use_container_width=True, hide_index=True)
+            with reg_tabs[1]:
+                mdl = Ridge(alpha=1.0).fit(X, y)
+                st.dataframe(pd.DataFrame({'Хувьсагч': features, 'Коэффициент': mdl.coef_}), use_container_width=True, hide_index=True)
+            with reg_tabs[2]:
+                mdl = Lasso(alpha=max(float(np.std(y))*0.001, 0.001), max_iter=5000).fit(X, y)
+                st.dataframe(pd.DataFrame({'Хувьсагч': features, 'Коэффициент': mdl.coef_}), use_container_width=True, hide_index=True)
+            with reg_tabs[3]:
+                mdl = ElasticNet(alpha=max(float(np.std(y))*0.001, 0.001), l1_ratio=0.5, max_iter=5000).fit(X, y)
+                st.dataframe(pd.DataFrame({'Хувьсагч': features, 'Коэффициент': mdl.coef_}), use_container_width=True, hide_index=True)
+            with reg_tabs[4]:
+                y_bin = (y > y.median()).astype(int)
+                try:
+                    mdl = LogisticRegression(max_iter=2000).fit(X, y_bin)
+                    st.dataframe(pd.DataFrame({'Хувьсагч': features, 'Коэффициент': mdl.coef_[0]}), use_container_width=True, hide_index=True)
+                except Exception as e:
+                    st.warning(f'Logistic Regression ажиллуулж чадсангүй: {e}')
+            with reg_tabs[5]:
+                lin = LinearRegression().fit(X, y)
+                pred = lin.predict(X)
+                r2 = lin.score(X, y)
+                m1, m2, m3 = st.columns(3)
+                m1.metric('R²', f'{r2:.4f}')
+                m2.metric('Мөрийн тоо', f'{len(X):,}')
+                m3.metric('Хувьсагчийн тоо', f'{len(features)}')
+                plot_df = pd.DataFrame({'Actual': y, 'Predicted': pred})
+                figr = px.scatter(plot_df.sample(min(len(plot_df), 3000), random_state=42), x='Actual', y='Predicted', title='Actual vs Predicted')
+                st.plotly_chart(figr, use_container_width=True)
+
+    # 5 Time series
+    with tabs[4]:
+        st.markdown("### ⏱ Хугацааны цувааны шинжилгээ")
+        time_col = None
+        if 'transaction_date' in raw_df.columns:
+            time_col = 'transaction_date'
+            raw_df[time_col] = pd.to_datetime(raw_df[time_col], errors='coerce')
+        value_col = st.selectbox('Цувааны үзүүлэлт', list(num.columns), key='ts_value_col')
+        if time_col and raw_df[time_col].notna().sum() > 10:
+            freq = st.selectbox('Нэгтгэх давтамж', ['D', 'M', 'Q'], index=1, key='ts_freq')
+            ts = raw_df[[time_col]].copy()
+            ts[value_col] = pd.to_numeric(raw_df[value_col], errors='coerce').fillna(0)
+            ts = ts.dropna(subset=[time_col]).set_index(time_col).resample(freq).sum(numeric_only=True)
+            ts = ts[[value_col]].dropna()
+            figt = px.line(ts.reset_index(), x=time_col, y=value_col, title=f'{value_col} хугацааны цуваа')
+            st.plotly_chart(figt, use_container_width=True)
+            ts['MovingAverage_3'] = ts[value_col].rolling(3).mean()
+            figma = px.line(ts.reset_index(), x=time_col, y=[value_col, 'MovingAverage_3'], title='Moving average')
+            st.plotly_chart(figma, use_container_width=True)
+            if seasonal_decompose is not None and len(ts) >= 12:
+                try:
+                    decomp = seasonal_decompose(ts[value_col], model='additive', period=max(2, min(12, len(ts)//2)))
+                    decomp_df = pd.DataFrame({
+                        time_col: ts.index,
+                        'Trend': decomp.trend,
+                        'Seasonal': decomp.seasonal,
+                        'Residual': decomp.resid
+                    }).dropna()
+                    figd = px.line(decomp_df, x=time_col, y=['Trend','Seasonal','Residual'], title='Seasonal decomposition')
+                    st.plotly_chart(figd, use_container_width=True)
+                except Exception as e:
+                    st.info(f'Decomposition ажиллуулж чадсангүй: {e}')
+        else:
+            st.info('Огнооны багана хангалтгүй тул хугацааны цуваа шинжилгээ хийгдээгүй.')
+
+    # 6 Multivariate
+    with tabs[5]:
+        st.markdown("### 🧠 Multivariate analysis")
+        xcols = st.multiselect('PCA хувьсагчууд', list(num.columns), default=list(num.columns[:min(8, len(num.columns))]), key='pca_cols')
+        if len(xcols) >= 2:
+            X = num[xcols].fillna(0)
+            scaler = StandardScaler()
+            Xs = scaler.fit_transform(X)
+            pca = PCA(n_components=2)
+            comps = pca.fit_transform(Xs)
+            pca_df = pd.DataFrame({'PC1': comps[:,0], 'PC2': comps[:,1]})
+            figp = px.scatter(pca_df.sample(min(len(pca_df), 5000), random_state=42), x='PC1', y='PC2', title='PCA 2D projection')
+            st.plotly_chart(figp, use_container_width=True)
+            st.dataframe(pd.DataFrame({
+                'Principal Component': ['PC1', 'PC2'],
+                'Explained Variance Ratio': pca.explained_variance_ratio_
+            }), use_container_width=True, hide_index=True)
+            km_n = st.slider('KMeans кластерын тоо', 2, 12, 4, key='stats_kmeans_n')
+            km = KMeans(n_clusters=km_n, n_init=10, random_state=42).fit(Xs)
+            pca_df['Cluster'] = km.labels_.astype(str)
+            figk = px.scatter(pca_df.sample(min(len(pca_df), 5000), random_state=42), x='PC1', y='PC2', color='Cluster', title='PCA + KMeans')
+            st.plotly_chart(figk, use_container_width=True)
+
+    # 7 Outlier
+    with tabs[6]:
+        st.markdown("### 🚨 Outlier detection")
+        out_col = st.selectbox('Outlier шалгах хувьсагч', list(num.columns), key='outlier_col')
+        s = num[out_col].fillna(0)
+        z = ((s - s.mean()) / (s.std() if s.std() else 1)).abs()
+        q1, q3 = s.quantile([0.25, 0.75])
+        iqr = q3 - q1
+        iqr_flag = (s < q1 - 1.5*iqr) | (s > q3 + 1.5*iqr)
+        out_df = pd.DataFrame({
+            'Value': s,
+            'Z-score abs': z,
+            'Z>3': z > 3,
+            'IQR outlier': iqr_flag
+        })
+        if len(num.columns) >= 2:
+            sample = num.sample(min(len(num), 10000), random_state=42).fillna(0)
+            try:
+                iso = IsolationForest(contamination=0.05, random_state=42)
+                out_df.loc[sample.index, 'IsolationForest'] = (iso.fit_predict(sample) == -1)
+            except Exception:
+                pass
+            try:
+                lof = LocalOutlierFactor(n_neighbors=min(20, max(2, len(sample)//20)))
+                out_df.loc[sample.index, 'LOF'] = (lof.fit_predict(sample) == -1)
+            except Exception:
+                pass
+            try:
+                svm = OneClassSVM(nu=0.05)
+                out_df.loc[sample.index, 'OneClassSVM'] = (svm.fit_predict(sample) == -1)
+            except Exception:
+                pass
+        st.dataframe(out_df.head(2000), use_container_width=True)
+        figo = px.scatter(out_df.reset_index().head(5000), x='index', y='Value', color='Z>3', title=f'{out_col} outlier view (Z-score)')
+        st.plotly_chart(figo, use_container_width=True)
+
+    # 8 Statistical tests
+    with tabs[7]:
+        st.markdown("### 🧪 Statistical tests")
+        test_col = st.selectbox('Тестийн үндсэн хувьсагч', list(num.columns), key='test_col')
+        s = num[test_col].dropna()
+        group_col = None
+        if 'year' in raw_df.columns:
+            group_col = 'year'
+        elif 'report_year' in raw_df.columns:
+            group_col = 'report_year'
+        results = []
+        try:
+            tstat, tp = stats.ttest_1samp(s.sample(min(len(s), 5000), random_state=42), popmean=s.median())
+            results.append({'Тест': 'One-sample t-test', 'Statistic': tstat, 'p-value': tp})
+        except Exception:
+            pass
+        if group_col and raw_df[group_col].nunique() >= 2:
+            try:
+                groups = []
+                for g in raw_df[group_col].dropna().unique()[:3]:
+                    vals = pd.to_numeric(raw_df.loc[raw_df[group_col] == g, test_col], errors='coerce').dropna()
+                    if len(vals) > 3:
+                        groups.append(vals.sample(min(len(vals), 5000), random_state=42))
+                if len(groups) >= 2:
+                    fstat, fp = stats.f_oneway(*groups)
+                    results.append({'Тест': f'ANOVA by {group_col}', 'Statistic': fstat, 'p-value': fp})
+            except Exception:
+                pass
+        try:
+            chi_bins = pd.qcut(s.rank(method='first'), q=min(5, max(2, s.nunique())), duplicates='drop')
+            freq = chi_bins.value_counts().sort_index()
+            chi_stat, chi_p = stats.chisquare(freq.values)
+            results.append({'Тест': 'Chi-square (binned uniformity)', 'Statistic': chi_stat, 'p-value': chi_p})
+        except Exception:
+            pass
+        if results:
+            st.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
+        else:
+            st.info('Статистик тест ажиллуулахад хангалттай нөхцөл бүрдээгүй.')
 
 if page.startswith("1"):
     st.header("1️⃣ Өгөгдөл оруулах, бэлтгэх")
     st.markdown("Файлаа нэг удаа оруулаад дараагийн цэсүүд дээр дахин ашиглаж болно.")
-    _show_info_box("Хурдан бэлтгэл", "Parser scan багасгасан, general journal дээр эрт зогсолт ба GZ шахалт ашиглаж өгөгдөл бэлтгэнэ. Том файл дээр progress харагдана.")
 
     uploaded = st.file_uploader("📎 Бүх файлуудаа энд оруулна уу", type=['xlsx', 'csv', 'gz'], accept_multiple_files=True, key='smart_prep_main')
-    acct_name_file = st.file_uploader("📋 Дансны нэрийн лавлах файл (заавал биш)", type=['xlsx'], key='acct_names_prep_main')
-    acct_name_map = parse_account_names(acct_name_file) if acct_name_file else {}
+    acct_name_file = st.file_uploader("📋 Дансны нэрийн лавлах файл / Дансны жагсаалт (заавал биш)", type=['xlsx'], key='acct_names_prep_main')
+    acct_name_map = st.session_state.get('account_name_map', {})
+    if acct_name_file:
+        acct_name_map = parse_account_names(acct_name_file)
+        st.session_state['account_name_map'] = acct_name_map
+        st.session_state['account_master_df'] = build_account_master_df(acct_name_map)
+    elif not acct_name_map and Path('dansnii_jagsaalt.xlsx').exists():
+        try:
+            with open('dansnii_jagsaalt.xlsx', 'rb') as _f:
+                _bio = io.BytesIO(_f.read())
+                _bio.name = 'dansnii_jagsaalt.xlsx'
+            acct_name_map = parse_account_names(_bio)
+            st.session_state['account_name_map'] = acct_name_map
+            st.session_state['account_master_df'] = build_account_master_df(acct_name_map)
+        except Exception:
+            acct_name_map = {}
 
     cpa, cpb = st.columns([1,1])
     with cpa:
         if st.button('🛠️ Файлуудыг таньж бэлтгэх', type='primary', use_container_width=True):
             if uploaded:
-                title_box, bar, detail_box = _init_progress_ui()
-                _update_progress(title_box, bar, detail_box, 2, "Өгөгдөл бэлтгэх ажил эхэллээ", "Файлуудыг шалгаж байна...")
-                _prepare_from_uploaded(uploaded, acct_name_map, progress_ui=(title_box, bar, detail_box))
-                created = _build_part1_from_prepared_ledgers(progress_ui=(title_box, bar, detail_box))
-                _finish_progress(title_box, bar, detail_box, f'Файлууд бэлтгэгдлээ. Ledger-ээс {created} Part1 файл үүсгэлээ.')
+                _prepare_from_uploaded(uploaded, acct_name_map)
+                created = _build_part1_from_prepared_ledgers()
                 st.success(f'✅ Файлууд бэлтгэгдлээ. Ledger-ээс {created} Part1 файл үүсгэлээ.')
             else:
                 st.warning('Файл оруулна уу.')
@@ -2045,8 +2311,17 @@ if page.startswith("1"):
         st.metric('Part1 файл', len(st.session_state.get('prepared_part1_cache', {})))
 
     _render_downloads('### 📦 Бэлэн болсон TB файлууд', 'prepared_tb_cache', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-    _render_downloads('### 📦 Бэлэн болсон Ledger файлууд', 'prepared_ledger_cache', 'application/octet-stream')
+    _render_downloads('### 📦 Бэлэн болсон Ledger файлууд (GZ-шахсан CSV)', 'prepared_ledger_cache', 'text/csv')
     _render_downloads('### 📦 Бэлэн болсон Part1 файлууд', 'prepared_part1_cache', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    acct_master_df = st.session_state.get('account_master_df', pd.DataFrame())
+    if acct_master_df is not None and not acct_master_df.empty:
+        st.markdown('### 🧾 Дансны мастер лавлах')
+        cma, cmb = st.columns([1,2])
+        cma.metric('Танигдах дансны код', f"{len(acct_master_df):,}")
+        cmb.caption('Гүйлгээний код дотор энэ жагсаалтын код агуулагдаж байвал систем урт prefix-ээр нь танина.')
+        st.dataframe(acct_master_df.head(200), use_container_width=True, hide_index=True)
+        _show_dataframe_download(acct_master_df[['account_code','account_name']], 'account_master.csv', label='📥 Дансны мастер CSV татах')
+
 
 elif page.startswith("2"):
     st.header("2️⃣ Гүйлгээ балансын шинжилгээ")
@@ -2090,25 +2365,20 @@ elif page.startswith("2"):
             excl_settings[tag] = st.checkbox(rule['label'], value=rule.get('default', False), help=rule.get('help',''), key=f'tb_excl_{tag}')
 
     st.caption(f"Бэлэн TB: {len(tb_files)} файл • Бэлэн Part1: {len(p1_files)} файл")
-    if st.button('🚀 TB шинжилгээ эхлүүлэх', type='primary', use_container_width=True, key='run_tb_analysis_main'):
+    if st.button('🚀 Гүйлгээ балансын шинжилгээ эхлүүлэх', type='primary', use_container_width=True, key='run_tb_analysis_main'):
         try:
-            title_box, bar, detail_box = _init_progress_ui()
-            _update_progress(title_box, bar, detail_box, 5, "Гүйлгээ балансын шинжилгээ эхэллээ", "TB болон Part1 өгөгдлийг уншиж байна...")
             tb_all, tb_stats = load_tb(tb_files) if tb_files else (pd.DataFrame(), {})
-            _update_progress(title_box, bar, detail_box, 25, "Part1 болон сарын нэгтгэлийг уншиж байна", "TB summary ба risk matrix-г бэлдэж байна...")
             rm_all, mo_all = load_part1(p1_files) if p1_files else (pd.DataFrame(), pd.DataFrame())
             tb_show = tb_all.copy()
             if not tb_show.empty:
-                _update_progress(title_box, bar, detail_box, 50, "TB өгөгдлийг цэвэрлэж байна", "Хасах бүлэг болон account-level filter хэрэглэж байна...")
                 tb_show = classify_exclusions(tb_show, level='account')
                 active_tags = [k for k, v in excl_settings.items() if v]
                 if active_tags:
                     tb_show = tb_show[~tb_show['exclusion_tag'].isin(active_tags)].copy()
-                _update_progress(title_box, bar, detail_box, 75, "ML болон XAI тооцож байна", "Isolation Forest, Z-score, Turn Ratio, Ensemble...")
                 ml_df, X, y, feats, res, best, fi, ym = run_ml(tb_show, cont, nest)
+                fi = localize_feature_df(fi, context='tb')
             else:
                 ml_df, fi = pd.DataFrame(), pd.DataFrame()
-            _update_progress(title_box, bar, detail_box, 92, "Үр дүнг хадгалж байна", "Session state болон dashboard-г шинэчилж байна...")
             st.session_state['tb_analysis_done'] = True
             st.session_state['tb_all'] = tb_all
             st.session_state['tb_stats'] = tb_stats
@@ -2118,8 +2388,7 @@ elif page.startswith("2"):
             st.session_state['tb_ml_df'] = ml_df
             st.session_state['tb_feature_importance'] = fi
             st.session_state['tb_error'] = ''
-            _finish_progress(title_box, bar, detail_box, 'Гүйлгээ балансын шинжилгээ амжилттай дууслаа.')
-            st.success('✅ TB шинжилгээ дууслаа.')
+            st.success('✅ Гүйлгээ балансын шинжилгээ дууслаа.')
         except Exception as e:
             st.session_state['tb_error'] = str(e)
             st.exception(e)
@@ -2127,47 +2396,137 @@ elif page.startswith("2"):
     if st.session_state.get('tb_error'):
         st.error(st.session_state['tb_error'])
 
+
     if st.session_state.get('tb_analysis_done', False):
         tb_stats = st.session_state.get('tb_stats', {})
+        ml_df = st.session_state.get('tb_ml_df', pd.DataFrame())
         rm_all = st.session_state.get('rm_all', pd.DataFrame())
         mo_all = st.session_state.get('mo_all', pd.DataFrame())
-        ml_df = st.session_state.get('tb_ml_df', pd.DataFrame())
         fi = st.session_state.get('tb_feature_importance', pd.DataFrame())
+        tb_all_state = st.session_state.get('tb_all', pd.DataFrame())
 
-        if tb_stats:
-            rows = [{'Он': yr, 'Данс': vals.get('accounts', 0), 'Дебит эргэлт': vals.get('turnover_d', 0), 'Кредит эргэлт': vals.get('turnover_c', 0)} for yr, vals in sorted(tb_stats.items())]
-            st.markdown('### 📊 Гүйлгээ балансын ерөнхий тойм')
-            _show_info_box('Тайлбар', 'Энэ хүснэгт нь жил тус бүрийн дансны тоо, дебит/кредит эргэлтийн цар хүрээг харуулна. Огцом өөрчлөлт гарвал ISA 315/520-ын дагуу нэмэлт шалгалт хийнэ.')
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-        if not ml_df.empty:
-            st.markdown('### 🤖 Гүйлгээ балансын аномали шинжилгээ')
-            _show_info_box('Алгоритмын тайлбар', 'Isolation Forest, Z-score, Turn Ratio, Ensemble аргуудыг хамтад нь ашиглаж account-level эрсдэлийг үнэлнэ.')
-            show_cols = [c for c in ['year','account_code','account_name','iso_anomaly','zscore_anomaly','turn_anomaly','ensemble_anomaly'] if c in ml_df.columns]
-            st.dataframe(ml_df.sort_values(['ensemble_anomaly','year'], ascending=[False, True])[show_cols].head(500), use_container_width=True, hide_index=True)
-            _show_dataframe_download(ml_df, 'tb_anomaly_results.csv')
-        if not fi.empty:
-            st.markdown('### 🔎 XAI / Шинж чанарын нөлөөлөл')
-            fi = localize_feature_df(fi, context='tb') if 'feature' in fi.columns else fi
-            _show_info_box('XAI тайлбар', 'Шинж чанарын нөлөөлөл өндөр байх тусам тухайн хувьсагч эрсдэлийн шийдвэрт илүү их нөлөөлсөн гэсэн үг.')
-            st.dataframe(fi, use_container_width=True, hide_index=True)
-        if not rm_all.empty:
+        available_years = []
+        if tb_all_state is not None and not tb_all_state.empty and 'year' in tb_all_state.columns:
+            available_years = sorted(pd.Series(tb_all_state['year']).dropna().astype(int).unique().tolist())
+        selected_year = st.selectbox('📅 TB тайлант он сонгох', ['Бүгд'] + [str(y) for y in available_years], key='tb_year_select_final')
+
+        ml_view = ml_df.copy()
+        rm_view = rm_all.copy()
+        mo_view = mo_all.copy()
+        if selected_year != 'Бүгд':
+            if not ml_view.empty and 'year' in ml_view.columns:
+                ml_view = ml_view[ml_view['year'].astype(str) == selected_year]
+            if not rm_view.empty and 'year' in rm_view.columns:
+                rm_view = rm_view[rm_view['year'].astype(str) == selected_year]
+            if not mo_view.empty and 'year' in mo_view.columns:
+                mo_view = mo_view[mo_view['year'].astype(str) == selected_year]
+
+        tab_tb1, tab_tb2, tab_tb3, tab_tb4 = st.tabs(['🤖 TB аномали', '🔎 TB XAI / Feature importance', '📋 Part1 эрсдэлийн матриц', '📈 Сарын хандлага'])
+
+        with tab_tb1:
+            try:
+                td.show_anomaly_description()
+            except Exception:
+                st.markdown('### 🤖 TB аномали шинжилгээ')
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric('Шинжилсэн данс', f"{len(ml_view):,}")
+            c2.metric('Хэвийн бус данс', f"{int(ml_view['ensemble_anomaly'].sum()) if 'ensemble_anomaly' in ml_view.columns else 0:,}")
+            c3.metric('Isolation Forest', f"{int(ml_view['iso_anomaly'].sum()) if 'iso_anomaly' in ml_view.columns else 0:,}")
+            c4.metric('Z-score / Turn ratio', f"{int(ml_view['zscore_anomaly'].sum()) if 'zscore_anomaly' in ml_view.columns else 0:,} / {int(ml_view['turn_anomaly'].sum()) if 'turn_anomaly' in ml_view.columns else 0:,}")
+
+            if not ml_view.empty:
+                if {'log_turn_d','log_abs_change','ensemble_anomaly'}.issubset(ml_view.columns):
+                    scatter_df = ml_view.copy()
+                    scatter_df['Төлөв'] = scatter_df['ensemble_anomaly'].map({0:'Хэвийн',1:'Аномали'}).fillna('Хэвийн')
+                    fig_sc = px.scatter(
+                        scatter_df,
+                        x='log_turn_d', y='log_abs_change',
+                        color='Төлөв',
+                        hover_data=[c for c in ['account_code','account_name','year','turn_ratio'] if c in scatter_df.columns],
+                        color_discrete_map={'Хэвийн':'#90caf9', 'Аномали':'#c62828'},
+                        opacity=0.65,
+                        title='TB аномалийн тархалт'
+                    )
+                    st.plotly_chart(fig_sc, use_container_width=True)
+                show_cols = [c for c in ['year','account_code','account_name','iso_anomaly','zscore_anomaly','turn_anomaly','ensemble_anomaly'] if c in ml_view.columns]
+                st.dataframe(ml_view.sort_values(['ensemble_anomaly','year'], ascending=[False, True])[show_cols].head(1000), use_container_width=True, hide_index=True)
+                _show_dataframe_download(ml_view, f'tb_anomaly_results_{selected_year}.csv')
+                try:
+                    td.show_anomaly_interpretation(
+                        n_if=int(ml_view['iso_anomaly'].sum()) if 'iso_anomaly' in ml_view.columns else 0,
+                        n_zscore=int(ml_view['zscore_anomaly'].sum()) if 'zscore_anomaly' in ml_view.columns else 0,
+                        n_turn=int(ml_view['turn_anomaly'].sum()) if 'turn_anomaly' in ml_view.columns else 0,
+                        n_ensemble=int(ml_view['ensemble_anomaly'].sum()) if 'ensemble_anomaly' in ml_view.columns else 0,
+                    )
+                except Exception:
+                    pass
+
+        with tab_tb2:
+            st.markdown('### 🔎 TB XAI / Feature importance')
+            st.caption('Дансны аномалид хамгийн их нөлөөлсөн шинж чанаруудыг доорх график харуулна.')
+            if not fi.empty:
+                st.dataframe(fi.rename(columns={'feature':'Шинж чанар','importance':'Ач холбогдол'}), use_container_width=True, hide_index=True)
+                st.caption('Шинжилгээнд ашигласан үзүүлэлтүүдийн монгол тайлбар: дебит/кредит эргэлтийн логарифм, өөрчлөлтийн логарифм, өсөлтийн хурд, дебит/кредит харьцаа зэрэг болно.')
+                st.dataframe(ALGORITHM_DETAILS[ALGORITHM_DETAILS['Алгоритм'].isin(['Isolation Forest','Z-score','Turn ratio'])], use_container_width=True, hide_index=True)
+                fig_fi = px.bar(
+                    fi.head(15),
+                    x='importance', y='feature',
+                    orientation='h',
+                    color='importance',
+                    color_continuous_scale='Blues',
+                    title='Шинж чанарын ач холбогдол'
+                )
+                fig_fi.update_layout(height=450, yaxis={'categoryorder': 'total ascending'})
+                st.plotly_chart(fig_fi, use_container_width=True)
+            else:
+                st.info('Feature importance одоогоор бэлэн болоогүй байна.')
+
+        with tab_tb3:
             st.markdown('### 📋 Part1 эрсдэлийн матриц')
-            _show_info_box('Тайлбар', 'Данс × Харилцагч × Сар түвшний risk matrix нь өндөр дүн, өндөр давтамжтай гүйлгээг илрүүлнэ.')
-            st.dataframe(rm_all.head(300), use_container_width=True, hide_index=True)
-        if not mo_all.empty and 'month' in mo_all.columns and 'total_debit_mnt' in mo_all.columns:
+            st.caption('Данс × харилцагч × сар түвшинд их дүн, өндөр давтамжийн эрсдэлийг нэгтгэн харуулна.')
+            if not rm_view.empty:
+                c1, c2, c3 = st.columns(3)
+                c1.metric('Нийт хос', f"{len(rm_view):,}")
+                c2.metric('Эрсдэлтэй хос', f"{len(rm_view[rm_view['risk_score']>0]) if 'risk_score' in rm_view.columns else 0:,}")
+                c3.metric('Өндөр эрсдэл', f"{len(rm_view[rm_view['risk_level'].astype(str).str.contains('Өндөр', na=False)]) if 'risk_level' in rm_view.columns else 0:,}")
+                top_rm = rm_view.copy()
+                if 'risk_score' in top_rm.columns:
+                    top_rm = top_rm.sort_values(['risk_score','transaction_count'], ascending=[False, False])
+                st.dataframe(top_rm.head(500), use_container_width=True, hide_index=True)
+                if {'counterparty_name','transaction_count'}.issubset(top_rm.columns):
+                    top_cp = top_rm.groupby('counterparty_name', dropna=False)['transaction_count'].sum().sort_values(ascending=False).head(20).reset_index()
+                    top_cp.columns = ['Харилцагч', 'Гүйлгээний тоо']
+                    fig_cp = px.bar(top_cp, x='Гүйлгээний тоо', y='Харилцагч', orientation='h', title='Эрсдэл өндөртэй 20 харилцагч')
+                    fig_cp.update_layout(height=500, yaxis={'categoryorder':'total ascending'})
+                    st.plotly_chart(fig_cp, use_container_width=True)
+                _show_dataframe_download(top_rm, f'part1_risk_matrix_{selected_year}.csv')
+            else:
+                st.info('Part1 эрсдэлийн матриц олдсонгүй.')
+
+        with tab_tb4:
             st.markdown('### 📈 Сарын хандлага')
-            _show_info_box('ISA 520', 'Сарын хандлагын графикаар улирлын нөлөө, жилийн эцсийн огцом хөдөлгөөн, unusual spike-ийг илрүүлнэ.')
-            mo_plot = mo_all.copy()
-            mo_plot['total_debit_mnt'] = pd.to_numeric(mo_plot['total_debit_mnt'], errors='coerce').fillna(0)
-            fig_mo = px.line(mo_plot, x='month', y='total_debit_mnt', color='year' if 'year' in mo_plot.columns else None, title='Сарын дебит хөдөлгөөн')
-            st.plotly_chart(fig_mo, use_container_width=True)
+            st.caption('Сарын дебит хөдөлгөөн болон гүйлгээний тоогоор улирлын болон онцгой хэлбэлзлийг шалгана.')
+            if not mo_view.empty and 'month' in mo_view.columns:
+                metric_col = 'total_debit_mnt' if 'total_debit_mnt' in mo_view.columns else mo_view.columns[0]
+                metric_label = st.selectbox('Үзүүлэх үзүүлэлт', [c for c in ['total_debit_mnt','total_credit_mnt','transaction_count','ending_balance_mnt'] if c in mo_view.columns], key='tb_mo_metric')
+                mo_plot = mo_view.copy()
+                mo_plot[metric_label] = pd.to_numeric(mo_plot[metric_label], errors='coerce').fillna(0)
+                color_col = 'account_code' if 'account_code' in mo_plot.columns else None
+                fig_mo = px.line(mo_plot.sort_values('month'), x='month', y=metric_label, color=color_col, title='Сарын хандлагын шинжилгээ')
+                st.plotly_chart(fig_mo, use_container_width=True)
+                agg = mo_plot.groupby('month')[metric_label].sum().reset_index()
+                fig_bar = px.bar(agg, x='month', y=metric_label, title='Сарын нийлбэр хөдөлгөөн')
+                st.plotly_chart(fig_bar, use_container_width=True)
+                st.dataframe(mo_plot.head(500), use_container_width=True, hide_index=True)
+                _show_dataframe_download(mo_plot, f'monthly_trend_{selected_year}.csv')
+            else:
+                st.info('Сарын хандлагын мэдээлэл олдсонгүй.')
     else:
         st.info('👆 Энд шууд файл оруулах эсвэл 1️⃣ цэсэнд бэлтгэсэн TB/Part1 файлаа ашиглаад шинжилгээг эхлүүлнэ үү.')
 
 elif page.startswith("3"):
     st.header("3️⃣ Ерөнхий журналын шинжилгээ")
     st.markdown("Ledger/ЕЖ файлуудын transaction-level ML + XAI шинжилгээ.")
-    _show_info_box('Хурдан горим', 'Journal analysis нь chunk sample, эрт зогсолт, sample cap ашиглаж хурдыг сайжруулна. Үр дүнг аудитын шийдвэрийн дэмжлэг болгон ашиглана.')
 
     ej_files = st.file_uploader("📎 Нэмэлт ЕЖ эсвэл ledger файл оруулах", type=['xlsx','csv','gz'], accept_multiple_files=True, key='journal_page_upload')
     if ej_files:
@@ -2195,6 +2554,8 @@ elif page.startswith("3"):
         j_cont = st.slider('🎯 Аномалийн хувь', 0.01, 0.20, 0.05, 0.01, key='j_cont_work')
     with cj2:
         j_clusters = st.slider('🧩 KMeans кластерын тоо', 2, 20, 8, 1, key='j_clusters_work')
+    j_sample_size = st.slider('⚡ Journal sample хэмжээ (ML шинжилгээнд)', 10000, 120000, 50000, 5000, key='j_sample_size_work')
+    st.caption('Том ledger файл дээр ML шинжилгээнд төлөөлөх sample ашиглаж хурдыг сайжруулна. Бүрэн файл нь бэлтгэх цэсэнд GZ-шахсан CSV хэлбэрээр хадгалагдана.')
 
     with st.expander("🏷️ Эрсдэлийн шинжилгээнээс хасах бүлгүүд", expanded=False):
         excl_settings_j = {}
@@ -2204,31 +2565,48 @@ elif page.startswith("3"):
     st.caption(f"Бэлэн journal/ledger: {len(journal_inputs)} файл")
     if st.button('🚀 Ерөнхий журналын шинжилгээ эхлүүлэх', type='primary', use_container_width=True, key='run_journal_analysis_main'):
         try:
-            title_box, bar, detail_box = _init_progress_ui()
-            _update_progress(title_box, bar, detail_box, 3, "Ерөнхий журналын шинжилгээ эхэллээ", "⚡ Хурдан горим: ledger файлуудыг chunk sample-аар уншина.")
+            progress_box = st.empty()
+            prog = st.progress(0, text='Journal файлуудыг уншиж эхэлж байна...')
             frames = []
             ledger_stats_j = {}
             total_inputs = max(len(journal_inputs), 1)
-            max_rows_per_file = 60000
             for idx, (typ, f, year) in enumerate(journal_inputs, start=1):
-                file_name = Path(getattr(f, 'name', f'file_{idx}')).name
-                _update_progress(title_box, bar, detail_box, 5 + int(idx/total_inputs*35), "Journal файлуудыг боловсруулж байна", f"{file_name} ({idx}/{total_inputs}) • sample≤{max_rows_per_file:,}")
-                fast_df, meta = _fast_read_journal_input(typ, f, year, max_rows=max_rows_per_file, chunksize=100000)
-                if not fast_df.empty:
-                    frames.append(fast_df)
-                    ledger_stats_j[file_name] = meta
+                progress_box.info(f'Уншиж байна: {Path(getattr(f, "name", f"file_{idx}")).name} ({idx}/{total_inputs})')
+                if typ == 'ledger':
+                    f.seek(0)
+                    led_stats_map, led_df = load_ledger_stats([f], sample_per_year=j_sample_size, chunksize=100000)
+                    if not led_df.empty:
+                        led_df = merge_account_names(led_df, st.session_state.get('account_name_map', {}))
+                        frames.append(led_df)
+                    file_stats = led_stats_map.get(year, {}) if isinstance(led_stats_map, dict) else {}
+                    ledger_stats_j[Path(f.name).name] = {'rows': int(file_stats.get('rows', len(led_df))), 'accounts': int(file_stats.get('accounts', led_df.get('account_code', pd.Series(dtype=str)).astype(str).nunique() if not led_df.empty else 0)), 'sample_rows': int(len(led_df))}
+                    prog.progress(int(idx/total_inputs*40), text='Ledger файлыг chunk-ээр уншиж, sample бэлтгэж байна...')
+                elif typ == 'edt':
+                    f.seek(0)
+                    edt_df, cnt = process_edt(f, year)
+                    if cnt > 0 and not edt_df.empty:
+                        if len(edt_df) > j_sample_size:
+                            edt_df = edt_df.sample(n=j_sample_size, random_state=42)
+                        edt_df = merge_account_names(edt_df, st.session_state.get('account_name_map', {}))
+                        frames.append(edt_df)
+                        ledger_stats_j[Path(f.name).name] = {'rows': int(cnt), 'accounts': int(edt_df.get('account_code', pd.Series(dtype=str)).astype(str).nunique()), 'sample_rows': int(len(edt_df))}
+                    prog.progress(int(idx/total_inputs*40), text='ЕЖ файлыг стандарт хэлбэрт хөрвүүлж, sample сонгож байна...')
+                else:
+                    prog.progress(int(idx/total_inputs*40), text='Файлын төрлийг шалгаж байна...')
             if not frames:
                 raise ValueError('Journal/ledger өгөгдөл олдсонгүй.')
-            _update_progress(title_box, bar, detail_box, 50, "Journal өгөгдлийг нэгтгэж байна", "Sample-уудыг нэгтгэж, NaN цэвэрлэж байна...")
+            progress_box.info('Нэгтгэж, цэвэрлэж, шинжилгээнд бэлдэж байна...')
+            prog.progress(55, text='Өгөгдлийг нэгтгэж байна...')
             ledger_sample_j = pd.concat(frames, ignore_index=True)
-            if len(ledger_sample_j) > 80000:
-                ledger_sample_j = ledger_sample_j.sample(80000, random_state=42)
             ledger_sample_j = clean_for_risk(ledger_sample_j)
-            _update_progress(title_box, bar, detail_box, 70, "Feature engineering хийж байна", f"ML орох мөрийн тоо: {len(ledger_sample_j):,}")
+            prog.progress(70, text='Шинж чанар үүсгэж, ML шинжилгээ бэлдэж байна...')
             ml_result_j, ml_feats_j, model_summary_j, xai_importance_j = run_txn_ml_ensemble(ledger_sample_j, contamination=j_cont, n_clusters=j_clusters)
+            progress_box.info('ML алгоритмуудыг ажиллуулж байна...')
+            prog.progress(90, text='ML ensemble болон XAI тайлбарыг тооцоолж байна...')
+            ml_result_j = localize_feature_df(ml_result_j, context='journal')
+            xai_importance_j = localize_feature_df(xai_importance_j, context='journal')
             if ml_result_j.empty:
                 raise ValueError('ML шинжилгээ хийхэд хангалттай мөр алга.')
-            _update_progress(title_box, bar, detail_box, 90, "Эрсдэлийн шүүлт ба XAI бэлдэж байна", "Ensemble, XAI, хасах бүлгүүд, dashboard...")
             ml_result_j = classify_exclusions(ml_result_j, level='transaction')
             active_tags_j = [k for k, v in excl_settings_j.items() if v]
             ml_show_j = ml_result_j[~ml_result_j['exclusion_tag'].isin(active_tags_j)].copy() if active_tags_j else ml_result_j.copy()
@@ -2239,11 +2617,17 @@ elif page.startswith("3"):
             st.session_state['journal_xai'] = xai_importance_j
             st.session_state['journal_ledger_stats'] = ledger_stats_j
             st.session_state['journal_error'] = ''
-            _finish_progress(title_box, bar, detail_box, 'Ерөнхий журналын шинжилгээ амжилттай дууслаа.')
+            prog.progress(100, text='Journal шинжилгээ дууслаа.')
+            progress_box.success('Уншилт, ML, XAI тайлбар амжилттай дууслаа.')
             st.success('✅ Ерөнхий журналын шинжилгээ дууслаа.')
         except Exception as e:
             st.session_state['journal_error'] = str(e)
+            try:
+                progress_box.error('Journal шинжилгээ зогслоо. Доорх алдааг шалгана уу.')
+            except Exception:
+                pass
             st.exception(e)
+
 
     if st.session_state.get('journal_error'):
         st.error(st.session_state['journal_error'])
@@ -2254,39 +2638,97 @@ elif page.startswith("3"):
         xai_importance_j = st.session_state.get('journal_xai', pd.DataFrame())
         ledger_stats_j = st.session_state.get('journal_ledger_stats', {})
 
-        if ledger_stats_j:
-            st.markdown('### 📊 Ерөнхий журналын ерөнхий тойм')
-            _show_info_box('Тайлбар', 'Мөр, дансны тоо, sample хэмжээ нь journal analysis-д ашиглагдсан бодит ачааллыг харуулна.')
-            st.dataframe(pd.DataFrame([{'Файл': k, 'Мөр': v.get('rows', 0), 'Данс': v.get('accounts', 0)} for k, v in ledger_stats_j.items()]), use_container_width=True, hide_index=True)
-        if not model_summary_j.empty:
-            st.markdown('### 🤖 Алгоритмын тойм')
-            _show_info_box('Алгоритмууд', 'Isolation Forest, LOF, One-Class SVM, KMeans, Ensemble vote ашиглаж гүйлгээний эрсдэлийг илрүүлнэ.')
-            st.dataframe(model_summary_j, use_container_width=True, hide_index=True)
-        if not ml_show_j.empty:
+        tab_j1, tab_j2, tab_j3, tab_j4 = st.tabs(['📊 Dashboard', '🔍 Өндөр эрсдэлтэй гүйлгээ', '👤 Харилцагч / Данс', '🧠 XAI / Model'])
+
+        with tab_j1:
+            st.markdown('### 📊 Ерөнхий журналын дашбоард')
+            st.caption('Процессын үе шатууд: файл унших → стандартжуулах → шинж чанар үүсгэх → ML алгоритмууд → XAI тайлбар. Том файл дээр хэсэг хугацаа шаардлагатай.')
+            if ledger_stats_j:
+                st.dataframe(pd.DataFrame([{'Файл': k, 'Нийт мөр': v.get('rows', 0), 'ML-д ашигласан sample': v.get('sample_rows', 0), 'Данс': v.get('accounts', 0)} for k, v in ledger_stats_j.items()]), use_container_width=True, hide_index=True)
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric('Шинжилсэн гүйлгээ', f"{len(ml_show_j):,}")
+            c2.metric('ML саналын дундаж', f"{ml_show_j['ml_vote_count'].mean():.2f}" if 'ml_vote_count' in ml_show_j.columns and len(ml_show_j) else '0')
+            c3.metric('Маш өндөр эрсдэл', f"{int((ml_show_j['ml_risk_level'].astype(str)=='🔴 Маш өндөр').sum()) if 'ml_risk_level' in ml_show_j.columns else 0:,}")
+            c4.metric('Танигдсан дансны нэртэй', f"{int(ml_show_j['account_name'].fillna('').astype(str).str.len().gt(0).sum()) if 'account_name' in ml_show_j.columns else 0:,}")
+            if not ml_show_j.empty and 'ml_risk_level' in ml_show_j.columns:
+                risk_order = ['🟢 Бага','🟡 Дунд','🟠 Өндөр','🔴 Маш өндөр']
+                rl = ml_show_j['ml_risk_level'].value_counts().reindex(risk_order).fillna(0).reset_index()
+                rl.columns = ['Эрсдэлийн түвшин','Гүйлгээний тоо']
+                fig_rl = px.bar(rl, x='Эрсдэлийн түвшин', y='Гүйлгээний тоо', color='Эрсдэлийн түвшин',
+                                color_discrete_map={'🟢 Бага':'#4CAF50','🟡 Дунд':'#FFC107','🟠 Өндөр':'#FF9800','🔴 Маш өндөр':'#F44336'},
+                                title='Ерөнхий журналын эрсдэлийн түвшний тархалт')
+                fig_rl.update_layout(showlegend=False, height=350)
+                st.plotly_chart(fig_rl, use_container_width=True)
+            if not ml_show_j.empty and {'transaction_date','amount'}.issubset(ml_show_j.columns):
+                trend = ml_show_j.copy()
+                trend['month_key'] = trend['transaction_date'].astype(str).str[:7]
+                trend = trend.groupby('month_key').agg(total_amount=('amount','sum'), txn=('amount','count')).reset_index()
+                fig_tr = make_subplots(rows=2, cols=1, subplot_titles=('Сарын нийт дүн', 'Сарын эрсдэлтэй гүйлгээний тоо'))
+                fig_tr.add_trace(go.Scatter(x=trend['month_key'], y=trend['total_amount'], name='Дүн'), row=1, col=1)
+                fig_tr.add_trace(go.Bar(x=trend['month_key'], y=trend['txn'], name='Гүйлгээ'), row=2, col=1)
+                fig_tr.update_layout(height=500)
+                st.plotly_chart(fig_tr, use_container_width=True)
+
+        with tab_j2:
             st.markdown('### 🔍 Өндөр эрсдэлтэй journal гүйлгээ')
-            ml_show_j = localize_feature_df(ml_show_j, context='journal') if 'xai_top_feature' in ml_show_j.columns else ml_show_j
-            _show_info_box('Тайлбар', 'Өндөр эрсдэлтэй мөрүүдийг баримтын шалгалт, cut-off test, management override болон unusual transaction procedure-оор баталгаажуулна.', kind='warning')
-            show_cols = [c for c in ['transaction_date','account_code','account_name','counterparty_name','amount','ml_vote_count','ml_risk_level','xai_top_feature','transaction_description'] if c in ml_show_j.columns]
-            sort_col = 'ml_vote_count' if 'ml_vote_count' in ml_show_j.columns else show_cols[0]
-            st.dataframe(ml_show_j.sort_values(sort_col, ascending=False)[show_cols].head(1000), use_container_width=True, hide_index=True)
-            _show_dataframe_download(ml_show_j, 'journal_ml_results.csv')
-        if not xai_importance_j.empty:
-            st.markdown('### 🧠 XAI / Шинж чанарын нөлөөлөл')
-            xai_importance_j = localize_feature_df(xai_importance_j, context='journal') if 'feature' in xai_importance_j.columns else xai_importance_j
-            _show_info_box('XAI тайлбар', 'Шинж чанарын нөлөөлөл өндөр бол тухайн variable journal anomaly шийдвэрт хүчтэй нөлөөлсөн гэсэн үг.')
-            st.dataframe(xai_importance_j, use_container_width=True, hide_index=True)
-            fig_fi = px.bar(xai_importance_j.head(15), x='importance', y='feature', orientation='h', title='Топ XAI шинж чанарууд')
-            st.plotly_chart(fig_fi, use_container_width=True)
+            if not ml_show_j.empty:
+                show_cols = [c for c in ['transaction_date','account_code','account_name','counterparty_name','amount','ml_vote_count','ml_risk_level','xai_top_feature','transaction_description'] if c in ml_show_j.columns]
+                sort_col = 'ml_vote_count' if 'ml_vote_count' in ml_show_j.columns else show_cols[0]
+                st.dataframe(ml_show_j.sort_values(sort_col, ascending=False)[show_cols].head(1000), use_container_width=True, hide_index=True)
+                _show_dataframe_download(ml_show_j, 'journal_ml_results.csv')
+            else:
+                st.info('Journal гүйлгээний үр дүн хоосон байна.')
+
+        with tab_j3:
+            st.markdown('### 👤 Харилцагч / Дансны төвлөрлийн шинжилгээ')
+            if not ml_show_j.empty and 'counterparty_name' in ml_show_j.columns:
+                cp = ml_show_j[ml_show_j['counterparty_name'].fillna('').astype(str).str.len() > 0].groupby('counterparty_name').agg(
+                    total=('amount','count'),
+                    high_risk=('ml_vote_count', lambda s: (pd.to_numeric(s, errors='coerce').fillna(0) >= 2).sum()),
+                    amount=('amount','sum'),
+                    accounts=('account_code','nunique')
+                ).reset_index().sort_values(['high_risk','amount'], ascending=[False, False]).head(30)
+                if not cp.empty:
+                    cp.columns = ['Харилцагч','Нийт гүйлгээ','Өндөр эрсдэл','Нийт дүн','Дансны тоо']
+                    st.dataframe(cp, use_container_width=True, hide_index=True)
+                    fig_cp = px.bar(cp.head(20), x='Өндөр эрсдэл', y='Харилцагч', orientation='h', color='Дансны тоо', title='Эрсдэл өндөртэй харилцагчид')
+                    fig_cp.update_layout(height=500, yaxis={'categoryorder':'total ascending'})
+                    st.plotly_chart(fig_cp, use_container_width=True)
+            if not ml_show_j.empty and 'account_code' in ml_show_j.columns:
+                acct = ml_show_j.groupby(['account_code','account_name'], dropna=False).agg(
+                    total=('amount','count'),
+                    high_risk=('ml_vote_count', lambda s: (pd.to_numeric(s, errors='coerce').fillna(0) >= 2).sum()),
+                    amount=('amount','sum')
+                ).reset_index().sort_values(['high_risk','amount'], ascending=[False, False]).head(30)
+                acct.columns = ['Дансны код','Дансны нэр','Нийт гүйлгээ','Өндөр эрсдэл','Нийт дүн']
+                st.dataframe(acct, use_container_width=True, hide_index=True)
+
+        with tab_j4:
+            st.markdown('### 🧠 XAI / Model summary')
+            st.caption('Алгоритм бүр өөр өнцгөөс аномали илрүүлдэг. Доорх хүснэгтэд Монгол тайлбар, давуу тал, анхаарах зүйлийг орууллаа.')
+            st.dataframe(ALGORITHM_DETAILS[ALGORITHM_DETAILS['Алгоритм'].isin(['Isolation Forest','Local Outlier Factor','One-Class SVM','KMeans distance','Ensemble ≥2 votes'])], use_container_width=True, hide_index=True)
+            if not model_summary_j.empty:
+                st.dataframe(model_summary_j, use_container_width=True, hide_index=True)
+            if not xai_importance_j.empty:
+                st.dataframe(xai_importance_j.rename(columns={'feature':'Шинж чанар','importance':'Ач холбогдол'}), use_container_width=True, hide_index=True)
+                fig_fi = px.bar(xai_importance_j.head(15), x='importance', y='feature', orientation='h', title='Top XAI features')
+                fig_fi.update_layout(height=450, yaxis={'categoryorder':'total ascending'})
+                st.plotly_chart(fig_fi, use_container_width=True)
+            else:
+                st.info('XAI / feature importance мэдээлэл олдсонгүй.')
     else:
         st.info('👆 1️⃣ цэсэнд бэлтгэсэн ledger/ЕЖ файлаа ашиглах эсвэл энд шууд оруулж шинжилгээг эхлүүлнэ үү.')
 
+
 elif page.startswith("4"):
-    _render_statistics_page()
+    _run_stats_lab()
 
 else:
     st.header("5️⃣ Материаллаг байдлын тооцоо")
-    st.markdown("TB файл дээр суурилсан материаллаг байдлын хуваарилалт.")
-    st.dataframe(ISA_GUIDE[ISA_GUIDE["Стандарт"].isin(["ISA 320","ISA 330"])], use_container_width=True, hide_index=True)
+    st.markdown("""
+    Энэ хэсэг нь TB өгөгдөл дээр суурилан данс бүрт нийт материаллаг байдлыг хуваарилна.
+    Хаалтын үлдэгдэл өндөр, эсвэл эргэлт өндөр дансанд илүү их зөвшөөрөгдөх алдааны босго онооно.
+    """)
 
     mat_files = st.file_uploader("📎 Нэмэлт TB файл оруулах", type=['xlsx'], accept_multiple_files=True, key='mat_files_work')
     tb_inputs = _cache_files('prepared_tb_cache')
@@ -2301,22 +2743,55 @@ else:
                 bio = io.BytesIO(buf.getvalue()); bio.name = f'TB_standardized_{year}_{Path(f.name).stem}.xlsx'
                 tb_inputs.append(bio)
 
+    base_choice = st.selectbox('Материаллаг байдлын суурь', ['Хаалтын үлдэгдэл', 'Эргэлтийн нийлбэр'], key='mat_base_choice')
     total_mat = st.number_input('Нийт материаллаг байдлын дүн', min_value=0.0, value=1000000.0, step=100000.0)
+    perf_ratio = st.slider('Гүйцэтгэлийн материаллаг байдлын хувь', 0.30, 1.00, 0.75, 0.05, key='perf_ratio')
     if st.button('📐 Материаллаг байдлыг тооцоолох', type='primary', use_container_width=True):
-        title_box, bar, detail_box = _init_progress_ui()
-        _update_progress(title_box, bar, detail_box, 10, "Материаллаг байдлын тооцоо эхэллээ", "TB өгөгдлийг уншиж байна...")
         tb_all, _ = load_tb(tb_inputs) if tb_inputs else (pd.DataFrame(), {})
         if tb_all.empty:
             st.warning('TB өгөгдөл олдсонгүй.')
         else:
             d = tb_all.copy()
-            _update_progress(title_box, bar, detail_box, 45, "Суурь дүнг тооцоолж байна", "Хаалтын үлдэгдэл эсвэл эргэлтийн суурийг бэлдэж байна...")
-            base_amt = d['closing_debit'].abs() + d['closing_credit'].abs() if 'closing_debit' in d.columns else d['turnover_debit'].abs() + d['turnover_credit'].abs()
-            total_base = base_amt.sum()
-            d['materiality_alloc'] = np.where(total_base > 0, total_mat * base_amt / total_base, 0)
-            _update_progress(title_box, bar, detail_box, 80, "Материаллаг байдлын хуваарилалт хийж байна", "Данс тус бүрийн босгыг тооцож байна...")
-            show_cols = [c for c in ['year','account_code','account_name','closing_debit','closing_credit','turnover_debit','turnover_credit','materiality_alloc'] if c in d.columns]
-            st.dataframe(d[show_cols].sort_values('materiality_alloc', ascending=False), use_container_width=True, hide_index=True)
-            _finish_progress(title_box, bar, detail_box, 'Материаллаг байдлын тооцоо амжилттай дууслаа.')
-            _show_info_box('ISA 320 тайлбар', 'Материаллаг байдлын хуваарилалт нь данс тус бүрийн зөвшөөрөгдөх алдааны босгыг тогтоох суурь болдог. Эрсдэл өндөр дансанд ISA 330-ийн дагуу илүү өргөн горим хэрэглэнэ.')
-            _show_dataframe_download(d[show_cols], 'materiality_by_account.csv')
+            if base_choice == 'Хаалтын үлдэгдэл':
+                base_amt = d.get('closing_debit', 0).abs() + d.get('closing_credit', 0).abs()
+                d['Суурь'] = 'Хаалтын үлдэгдэл'
+            else:
+                base_amt = d.get('turnover_debit', 0).abs() + d.get('turnover_credit', 0).abs()
+                d['Суурь'] = 'Эргэлтийн нийлбэр'
+            total_base = pd.to_numeric(base_amt, errors='coerce').fillna(0).sum()
+            d['materiality_alloc'] = np.where(total_base > 0, total_mat * pd.to_numeric(base_amt, errors='coerce').fillna(0) / total_base, 0)
+            d['performance_materiality'] = d['materiality_alloc'] * perf_ratio
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric('Нийт материаллаг байдал', f"₮{total_mat:,.0f}")
+            c2.metric('Гүйцэтгэлийн материаллаг байдал', f"₮{total_mat * perf_ratio:,.0f}")
+            c3.metric('Хуваарилсан данс', f"{len(d):,}")
+
+            show_cols = [c for c in ['year','account_code','account_name','closing_debit','closing_credit','turnover_debit','turnover_credit','materiality_alloc','performance_materiality'] if c in d.columns]
+            d_show = d[show_cols].sort_values('materiality_alloc', ascending=False)
+            st.dataframe(d_show, use_container_width=True, hide_index=True)
+
+            fig = px.bar(
+                d_show.head(20),
+                x='account_code',
+                y='materiality_alloc',
+                hover_data=[c for c in ['account_name','year','performance_materiality'] if c in d_show.columns],
+                title='Материаллаг байдлын хуваарилалт — өндөр ач холбогдолтой 20 данс'
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+            by_year = d_show.groupby('year', dropna=False)['materiality_alloc'].sum().reset_index() if 'year' in d_show.columns else pd.DataFrame()
+            if not by_year.empty:
+                fig2 = px.pie(by_year, values='materiality_alloc', names='year', title='Материаллаг байдлын онуудаарх бүтэц')
+                st.plotly_chart(fig2, use_container_width=True)
+
+            out = io.BytesIO()
+            with pd.ExcelWriter(out, engine='openpyxl') as w:
+                d_show.to_excel(w, sheet_name='Материаллаг_байдал', index=False)
+            out.seek(0)
+            st.download_button(
+                "📥 Материаллаг байдлын тооцоо татах",
+                data=out.getvalue(),
+                file_name='materiality_by_account.xlsx',
+                mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            )
