@@ -76,6 +76,65 @@ with st.sidebar:
 ACCT_RE_B = re.compile(r'Данс:\s*\[([^\]]+)\]\s*(.*)')
 ACCT_RE_P = re.compile(r'Данс:\s*(\d{3}-\d{2}-\d{2}-\d{3})\s+(.*)')
 
+
+
+FEATURE_LABELS_TB = {
+    'log_turn_d': 'Дебит эргэлтийн логарифм',
+    'log_turn_c': 'Кредит эргэлтийн логарифм',
+    'log_close_d': 'Дебит хаалтын үлдэгдлийн логарифм',
+    'log_close_c': 'Кредит хаалтын үлдэгдлийн логарифм',
+    'log_abs_change': 'Өөрчлөлтийн абсолют логарифм',
+    'cat_num': 'Дансны ангиллын кодчилол',
+    'turn_ratio': 'Дебит/кредит эргэлтийн харьцаа',
+    'growth_rate': 'Өсөлтийн хурд',
+    'year': 'Тайлант он',
+}
+FEATURE_LABELS_JOURNAL = {
+    'log_amount': 'Гүйлгээний дүнгийн логарифм',
+    'acct_cat_num': 'Дансны ангиллын кодчилол',
+    'benford_dev': 'Бенфордын хазайлт',
+    'is_round': 'Тэгш тоон дүн эсэх',
+    'amt_zscore': 'Данс доторх z-оноо',
+    'cp_rare': 'Ховор харилцагч',
+    'pair_rare': 'Ховор данс-харилцагч хос',
+    'desc_empty': 'Тайлбар хоосон эсэх',
+    'is_month_end': 'Сарын эцсийн огноо',
+    'is_year_end': 'Жилийн эцсийн огноо',
+    'is_dup': 'Давхардсан гүйлгээ',
+    'is_debit': 'Дебит талын бичилт',
+    'desc_mismatch': 'Тайлбар-дансны логик зөрчил',
+    'name_no_overlap': 'Дансны нэртэй үгийн давхцалгүй',
+    'dir_mismatch': 'Дебит/кредит чиглэлийн зөрчил',
+}
+ALGORITHM_DETAILS = pd.DataFrame([
+    {'Алгоритм':'Isolation Forest','Монгол тайлбар':'Олон модон тусгаарлалтаар бусдаас онцгой мөрийг олдог аномали алгоритм.','Ашиглалт':'Хэвийн бус данс, хэвийн бус гүйлгээ илрүүлэлт','Давуу тал':'Шошгогүй өгөгдөл дээр сайн ажиллана; хурдан','Анхаарах зүйл':'Contamination хувь хэт өндөр байвал хэт олон аномали гарч болно'},
+    {'Алгоритм':'Z-score','Монгол тайлбар':'Дундаж ба стандарт хазайлтаас хэдэн нэгж зайтай байгааг хэмждэг статистик арга.','Ашиглалт':'Хэт их дүн, хэт хэлбэлзэлтэй мөр шалгах','Давуу тал':'Ойлгоход амар; тайлбарлахад хялбар','Анхаарах зүйл':'Тархалт гажсан үед дангаараа хангалтгүй'},
+    {'Алгоритм':'Turn ratio','Монгол тайлбар':'Дебит ба кредитийн эргэлтийн харьцаа хэвийн түвшнээс зөрсөн эсэхийг шалгана.','Ашиглалт':'TB дээр бүтцийн гаж өөрчлөлт илрүүлэх','Давуу тал':'Дансны зан төлөвийн өөрчлөлтийг сайн харуулна','Анхаарах зүйл':'Кредит 0 үед харьцааг болгоомжтой тайлбарлана'},
+    {'Алгоритм':'Local Outlier Factor','Монгол тайлбар':'Ойр хөршүүдтэйгээ харьцуулахад хэт сийрэг байрласан мөрийг олдог.','Ашиглалт':'Журналын локал аномали илрүүлэх','Давуу тал':'Бүлэг доторх гаж мөрийг сайн барина','Анхаарах зүйл':'Хөршийн тоо бага/их сонговол мэдрэмж өөрчлөгдөнө'},
+    {'Алгоритм':'One-Class SVM','Монгол тайлбар':'Хэвийн мужийг сурч аваад түүнээс гадуурх мөрийг аномали гэж үздэг.','Ашиглалт':'Нарийн хилтэй аномали хайх','Давуу тал':'Нелинейр хэв шинж барина','Анхаарах зүйл':'Их өгөгдөл дээр удааширч болно'},
+    {'Алгоритм':'KMeans distance','Монгол тайлбар':'Кластерын төвөөс хол байрласан мөрийг эрсдэлтэй гэж үзнэ.','Ашиглалт':'Бүлэглэлд суурилсан ерөнхий аномали','Давуу тал':'Тайлбарлахад ойлгомжтой','Анхаарах зүйл':'Кластерын тоо буруу байвал чанар муудна'},
+    {'Алгоритм':'Ensemble ≥2 votes','Монгол тайлбар':'Олон алгоритмын санал нийлсэн мөрийг илүү өндөр эрсдэлтэй гэж ангилна.','Ашиглалт':'Journal AI-ийн эцсийн эрсдэлийн оноо','Давуу тал':'Нэг аргын алдааг бууруулна','Анхаарах зүйл':'Бүх аргын чанараас хамаарна'},
+])
+
+def localize_feature_name(name, context='tb'):
+    maps = FEATURE_LABELS_TB if context == 'tb' else FEATURE_LABELS_JOURNAL
+    return maps.get(str(name), str(name))
+
+def localize_feature_df(df, context='tb'):
+    if df is None or df.empty:
+        return df
+    d = df.copy()
+    if 'feature' in d.columns:
+        d['feature'] = d['feature'].map(lambda x: localize_feature_name(x, context))
+    if 'xai_top_feature' in d.columns:
+        d['xai_top_feature'] = d['xai_top_feature'].map(lambda x: localize_feature_name(x, context) if str(x) not in ('', 'nan', 'None') else '')
+    return d
+
+def _df_to_gz_csv_bytes(df):
+    raw = df.to_csv(index=False).encode('utf-8-sig')
+    return gzip.compress(raw)
+
+
 def parse_account(text):
     m = ACCT_RE_B.match(text)
     if m:
@@ -1552,6 +1611,7 @@ def _df_to_csv_bytes(df):
     return df.to_csv(index=False).encode('utf-8-sig')
 
 
+
 def _df_to_excel_bytes(df_map):
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine='openpyxl') as w:
@@ -1593,8 +1653,8 @@ def _prepare_from_uploaded(uploaded, acct_name_map=None):
                 if acct_name_map and not edt_df.empty:
                     edt_df = merge_account_names(edt_df, acct_name_map)
                 if cnt > 0 and not edt_df.empty:
-                    csv_name = f'ledger_from_EJ_{year}_{Path(f.name).stem}.csv'
-                    _cache_add('prepared_ledger_cache', csv_name, _df_to_csv_bytes(edt_df))
+                    csv_name = f'ledger_from_EJ_{year}_{Path(f.name).stem}.csv.gz'
+                    _cache_add('prepared_ledger_cache', csv_name, _df_to_gz_csv_bytes(edt_df))
         except Exception as e:
             detected_rows.append({'Файл': f.name, 'Төрөл': '❌ Алдаа', 'Он': '', 'Тайлбар': str(e)})
     st.session_state['prep_detected_rows'] = detected_rows
@@ -1624,12 +1684,14 @@ def _render_downloads(title, cache_key, mime):
     if files:
         st.markdown(title)
         for name, raw in files.items():
-            st.download_button(f'📥 {name}', raw, file_name=name, mime=mime, key=f'dl_{cache_key}_{name}')
+            dl_mime = 'application/gzip' if str(name).endswith('.gz') else mime
+            st.download_button(f'📥 {name}', raw, file_name=name, mime=dl_mime, key=f'dl_{cache_key}_{name}')
 
 
-def _show_dataframe_download(df, filename, label='📥 CSV татах'):
+def _show_dataframe_download(df, filename, label='📥 GZ-шахсан CSV татах'):
     if df is not None and not df.empty:
-        st.download_button(label, _df_to_csv_bytes(df), file_name=filename, mime='text/csv', key=f'dl_{filename}')
+        out_name = filename if filename.endswith('.gz') else filename.replace('.csv', '.csv.gz')
+        st.download_button(label, _df_to_gz_csv_bytes(df), file_name=out_name, mime='application/gzip', key=f'dl_{out_name}')
 
 
 if page.startswith("1"):
@@ -1688,7 +1750,7 @@ if page.startswith("1"):
         st.metric('Part1 файл', len(st.session_state.get('prepared_part1_cache', {})))
 
     _render_downloads('### 📦 Бэлэн болсон TB файлууд', 'prepared_tb_cache', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-    _render_downloads('### 📦 Бэлэн болсон Ledger файлууд', 'prepared_ledger_cache', 'text/csv')
+    _render_downloads('### 📦 Бэлэн болсон Ledger файлууд (GZ-шахсан CSV)', 'prepared_ledger_cache', 'text/csv')
     _render_downloads('### 📦 Бэлэн болсон Part1 файлууд', 'prepared_part1_cache', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
     acct_master_df = st.session_state.get('account_master_df', pd.DataFrame())
     if acct_master_df is not None and not acct_master_df.empty:
@@ -1753,6 +1815,7 @@ elif page.startswith("2"):
                 if active_tags:
                     tb_show = tb_show[~tb_show['exclusion_tag'].isin(active_tags)].copy()
                 ml_df, X, y, feats, res, best, fi, ym = run_ml(tb_show, cont, nest)
+                fi = localize_feature_df(fi, context='tb')
             else:
                 ml_df, fi = pd.DataFrame(), pd.DataFrame()
             st.session_state['tb_analysis_done'] = True
@@ -1841,7 +1904,9 @@ elif page.startswith("2"):
             st.markdown('### 🔎 TB XAI / Feature importance')
             st.caption('Дансны аномалид хамгийн их нөлөөлсөн шинж чанаруудыг доорх график харуулна.')
             if not fi.empty:
-                st.dataframe(fi, use_container_width=True, hide_index=True)
+                st.dataframe(fi.rename(columns={'feature':'Шинж чанар','importance':'Ач холбогдол'}), use_container_width=True, hide_index=True)
+                st.caption('Шинжилгээнд ашигласан үзүүлэлтүүдийн монгол тайлбар: дебит/кредит эргэлтийн логарифм, өөрчлөлтийн логарифм, өсөлтийн хурд, дебит/кредит харьцаа зэрэг болно.')
+                st.dataframe(ALGORITHM_DETAILS[ALGORITHM_DETAILS['Алгоритм'].isin(['Isolation Forest','Z-score','Turn ratio'])], use_container_width=True, hide_index=True)
                 fig_fi = px.bar(
                     fi.head(15),
                     x='importance', y='feature',
@@ -1937,9 +2002,13 @@ elif page.startswith("3"):
     st.caption(f"Бэлэн journal/ledger: {len(journal_inputs)} файл")
     if st.button('🚀 Ерөнхий журналын шинжилгээ эхлүүлэх', type='primary', use_container_width=True, key='run_journal_analysis_main'):
         try:
+            progress_box = st.empty()
+            prog = st.progress(0, text='Journal файлуудыг уншиж эхэлж байна...')
             frames = []
             ledger_stats_j = {}
-            for typ, f, year in journal_inputs:
+            total_inputs = max(len(journal_inputs), 1)
+            for idx, (typ, f, year) in enumerate(journal_inputs, start=1):
+                progress_box.info(f'Уншиж байна: {Path(getattr(f, "name", f"file_{idx}")).name} ({idx}/{total_inputs})')
                 if typ == 'ledger':
                     f.seek(0)
                     led_df = read_ledger(f)
@@ -1947,6 +2016,7 @@ elif page.startswith("3"):
                         led_df = merge_account_names(led_df, st.session_state.get('account_name_map', {}))
                         frames.append(led_df)
                         ledger_stats_j[Path(f.name).name] = {'rows': len(led_df), 'accounts': led_df.get('account_code', pd.Series(dtype=str)).astype(str).nunique()}
+                    prog.progress(int(idx/total_inputs*40), text='Journal файлуудыг уншиж байна...')
                 elif typ == 'edt':
                     f.seek(0)
                     edt_df, cnt = process_edt(f, year)
@@ -1954,11 +2024,21 @@ elif page.startswith("3"):
                         edt_df = merge_account_names(edt_df, st.session_state.get('account_name_map', {}))
                         frames.append(edt_df)
                         ledger_stats_j[Path(f.name).name] = {'rows': len(edt_df), 'accounts': edt_df.get('account_code', pd.Series(dtype=str)).astype(str).nunique()}
+                    prog.progress(int(idx/total_inputs*40), text='ЕЖ файлуудыг стандарт хэлбэрт хөрвүүлж байна...')
+                else:
+                    prog.progress(int(idx/total_inputs*40), text='Файлын төрлийг шалгаж байна...')
             if not frames:
                 raise ValueError('Journal/ledger өгөгдөл олдсонгүй.')
+            progress_box.info('Нэгтгэж, цэвэрлэж байна...')
+            prog.progress(55, text='Өгөгдлийг нэгтгэж байна...')
             ledger_sample_j = pd.concat(frames, ignore_index=True)
             ledger_sample_j = clean_for_risk(ledger_sample_j)
+            prog.progress(70, text='Шинж чанар үүсгэж, ML шинжилгээ бэлдэж байна...')
             ml_result_j, ml_feats_j, model_summary_j, xai_importance_j = run_txn_ml_ensemble(ledger_sample_j, contamination=j_cont, n_clusters=j_clusters)
+            progress_box.info('ML алгоритмуудыг ажиллуулж байна...')
+            prog.progress(90, text='ML ensemble болон XAI тайлбарыг тооцоолж байна...')
+            ml_result_j = localize_feature_df(ml_result_j, context='journal')
+            xai_importance_j = localize_feature_df(xai_importance_j, context='journal')
             if ml_result_j.empty:
                 raise ValueError('ML шинжилгээ хийхэд хангалттай мөр алга.')
             ml_result_j = classify_exclusions(ml_result_j, level='transaction')
@@ -1971,9 +2051,15 @@ elif page.startswith("3"):
             st.session_state['journal_xai'] = xai_importance_j
             st.session_state['journal_ledger_stats'] = ledger_stats_j
             st.session_state['journal_error'] = ''
+            prog.progress(100, text='Journal шинжилгээ дууслаа.')
+            progress_box.success('Уншилт, ML, XAI тайлбар амжилттай дууслаа.')
             st.success('✅ Ерөнхий журналын шинжилгээ дууслаа.')
         except Exception as e:
             st.session_state['journal_error'] = str(e)
+            try:
+                progress_box.error('Journal шинжилгээ зогслоо. Доорх алдааг шалгана уу.')
+            except Exception:
+                pass
             st.exception(e)
 
 
@@ -1990,6 +2076,7 @@ elif page.startswith("3"):
 
         with tab_j1:
             st.markdown('### 📊 Ерөнхий журналын дашбоард')
+            st.caption('Процессын үе шатууд: файл унших → стандартжуулах → шинж чанар үүсгэх → ML алгоритмууд → XAI тайлбар. Том файл дээр хэсэг хугацаа шаардлагатай.')
             if ledger_stats_j:
                 st.dataframe(pd.DataFrame([{'Файл': k, 'Мөр': v.get('rows', 0), 'Данс': v.get('accounts', 0)} for k, v in ledger_stats_j.items()]), use_container_width=True, hide_index=True)
             c1, c2, c3, c4 = st.columns(4)
@@ -2052,10 +2139,12 @@ elif page.startswith("3"):
 
         with tab_j4:
             st.markdown('### 🧠 XAI / Model summary')
+            st.caption('Алгоритм бүр өөр өнцгөөс аномали илрүүлдэг. Доорх хүснэгтэд Монгол тайлбар, давуу тал, анхаарах зүйлийг орууллаа.')
+            st.dataframe(ALGORITHM_DETAILS[ALGORITHM_DETAILS['Алгоритм'].isin(['Isolation Forest','Local Outlier Factor','One-Class SVM','KMeans distance','Ensemble ≥2 votes'])], use_container_width=True, hide_index=True)
             if not model_summary_j.empty:
                 st.dataframe(model_summary_j, use_container_width=True, hide_index=True)
             if not xai_importance_j.empty:
-                st.dataframe(xai_importance_j, use_container_width=True, hide_index=True)
+                st.dataframe(xai_importance_j.rename(columns={'feature':'Шинж чанар','importance':'Ач холбогдол'}), use_container_width=True, hide_index=True)
                 fig_fi = px.bar(xai_importance_j.head(15), x='importance', y='feature', orientation='h', title='Top XAI features')
                 fig_fi.update_layout(height=450, yaxis={'categoryorder':'total ascending'})
                 st.plotly_chart(fig_fi, use_container_width=True)
