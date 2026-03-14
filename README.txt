@@ -16,9 +16,3 @@ Audit AI v6.0 trial
 Ажиллуулах:
 1. pip install -r requirements.txt
 2. streamlit run audit_app.py
-
-
-v6.3 update:
-- 4️⃣ Статистик шинжилгээ тусдаа модуль
-- 5️⃣ Материаллаг байдлын тооцоо тусдаа модуль
-- Statistical Lab: descriptive, distribution, correlation, regression, time series, multivariate, outlier, tests

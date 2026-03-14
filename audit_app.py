@@ -42,7 +42,7 @@ except Exception:
 td = TabDescriptions()
 st.set_page_config(page_title="Аудитын эрсдэл илрүүлэх систем v6.0", page_icon="🔍", layout="wide")
 st.markdown('<h1 style="text-align:center;color:#1565c0">🔍 Аудитын эрсдэл илрүүлэх хиймэл оюуны систем</h1>', unsafe_allow_html=True)
-st.markdown('<p style="text-align:center;color:#666;font-size:14px">Гүйлгээ-баланс + Ерөнхий журнал → Дансны болон гүйлгээний түвшний эрсдэл илрүүлэлт • Материаллаг байдлын тооцоо • Статистик шинжилгээ</p>', unsafe_allow_html=True)
+st.markdown('<p style="text-align:center;color:#666;font-size:14px">Гүйлгээ-баланс + Ерөнхий журнал → Дансны болон гүйлгээний түвшний эрсдэл илрүүлэлт • Материаллаг байдлын тооцоо</p>', unsafe_allow_html=True)
 
 
 # ── Session state defaults ──
@@ -2719,6 +2719,9 @@ elif page.startswith("3"):
     else:
         st.info('👆 1️⃣ цэсэнд бэлтгэсэн ledger/ЕЖ файлаа ашиглах эсвэл энд шууд оруулж шинжилгээг эхлүүлнэ үү.')
 
+
+elif page.startswith("4"):
+    _run_stats_lab()
 
 else:
     st.header("5️⃣ Материаллаг байдлын тооцоо")
