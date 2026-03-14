@@ -21,6 +21,7 @@ from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_sco
 import warnings, io, re, gzip, zipfile
 from datetime import datetime
 from collections import Counter
+from pathlib import Path
 warnings.filterwarnings('ignore')
 from tab_descriptions import TabDescriptions
 try:
@@ -42,6 +43,8 @@ SESSION_DEFAULTS = {
     'journal_detected_rows': [],
     'tb_upload_cache': {},
     'journal_upload_cache': {},
+    'account_name_map': {},
+    'account_master_df': pd.DataFrame(),
 }
 for _k, _v in SESSION_DEFAULTS.items():
     if _k not in st.session_state:
@@ -1308,30 +1311,71 @@ def detect_file_type(f):
         return 'unknown', year
 
 
+
 def parse_account_names(file_obj):
     """Дансны код + нэрийн лавлах файл уншина.
-    Формат: A баганад дансны код (1, 31, 312, 3121, 31213, ...), B баганад нэр.
-    Санхүүгийн байдлын тайлан (СТ-1А) эсвэл дансны жагсаалт файл дэмжинэ.
+    Олон sheet-тэй дансны жагсаалт, СТ-1А, эсвэл 2-3 баганатай код/нэрийн лавлах файлыг дэмжинэ.
     """
     import openpyxl
     try:
         file_obj.seek(0)
         wb = openpyxl.load_workbook(file_obj, read_only=True, data_only=True)
-        ws = wb[wb.sheetnames[0]]
         code_map = {}
-        for row in ws.iter_rows(values_only=True):
-            c0 = str(row[0]).strip() if row[0] is not None else ''
-            c1 = str(row[1]).strip() if len(row) > 1 and row[1] is not None else ''
-            if not c0 or not c1:
-                continue
-            # Зөвхөн тоон код авах (1, 31, 312, 3121, 31213, ...)
-            c0_clean = re.sub(r'[^0-9]', '', c0)
-            if c0_clean and len(c0_clean) >= 1:
-                code_map[c0_clean] = c1.strip()
+        for sname in wb.sheetnames:
+            ws = wb[sname]
+            for row in ws.iter_rows(values_only=True):
+                vals = ["" if v is None else str(v).strip() for v in row[:4]]
+                low = " ".join(v.lower() for v in vals if v)
+                if not low or 'дансны код' in low or 'дансны нэр' in low:
+                    continue
+
+                candidates = []
+                if len(vals) >= 3:
+                    if vals[0]:
+                        candidates.append((vals[0], vals[2] or vals[1]))
+                    if vals[1]:
+                        candidates.append((vals[1], vals[2] or vals[0]))
+                elif len(vals) >= 2:
+                    candidates.append((vals[0], vals[1]))
+
+                for raw_code, raw_name in candidates:
+                    code_clean = re.sub(r'[^0-9]', '', str(raw_code))
+                    name_clean = str(raw_name).strip()
+                    if not code_clean or len(code_clean) < 2 or not name_clean:
+                        continue
+                    if name_clean.isdigit():
+                        continue
+                    code_map[code_clean] = name_clean
         wb.close()
+        file_obj.seek(0)
         return code_map
     except Exception:
+        try:
+            file_obj.seek(0)
+        except Exception:
+            pass
         return {}
+
+def build_account_master_df(code_map):
+    if not code_map:
+        return pd.DataFrame(columns=['account_code', 'account_name', 'code_len'])
+    master = pd.DataFrame(
+        [{'account_code': k, 'account_name': v, 'code_len': len(str(k))} for k, v in code_map.items()]
+    ).drop_duplicates(subset=['account_code']).sort_values(['code_len', 'account_code'], ascending=[False, True])
+    return master.reset_index(drop=True)
+
+def detect_account_from_master(code, code_map):
+    code_str = re.sub(r'[^0-9]', '', str(code))
+    if not code_str or not code_map:
+        return '', ''
+    for length in range(len(code_str), 1, -1):
+        prefix = code_str[:length]
+        if prefix in code_map:
+            return prefix, code_map[prefix]
+    for prefix, name in sorted(code_map.items(), key=lambda kv: len(kv[0]), reverse=True):
+        if prefix and prefix in code_str:
+            return prefix, name
+    return '', ''
 
 def merge_account_names(df, code_map):
     """Гүйлгээний DataFrame-д дансны нэрийг prefix matching-аар нэгтгэнэ.
@@ -1593,8 +1637,22 @@ if page.startswith("1"):
     st.markdown("Файлаа нэг удаа оруулаад дараагийн цэсүүд дээр дахин ашиглаж болно.")
 
     uploaded = st.file_uploader("📎 Бүх файлуудаа энд оруулна уу", type=['xlsx', 'csv', 'gz'], accept_multiple_files=True, key='smart_prep_main')
-    acct_name_file = st.file_uploader("📋 Дансны нэрийн лавлах файл (заавал биш)", type=['xlsx'], key='acct_names_prep_main')
-    acct_name_map = parse_account_names(acct_name_file) if acct_name_file else {}
+    acct_name_file = st.file_uploader("📋 Дансны нэрийн лавлах файл / Дансны жагсаалт (заавал биш)", type=['xlsx'], key='acct_names_prep_main')
+    acct_name_map = st.session_state.get('account_name_map', {})
+    if acct_name_file:
+        acct_name_map = parse_account_names(acct_name_file)
+        st.session_state['account_name_map'] = acct_name_map
+        st.session_state['account_master_df'] = build_account_master_df(acct_name_map)
+    elif not acct_name_map and Path('dansnii_jagsaalt.xlsx').exists():
+        try:
+            with open('dansnii_jagsaalt.xlsx', 'rb') as _f:
+                _bio = io.BytesIO(_f.read())
+                _bio.name = 'dansnii_jagsaalt.xlsx'
+            acct_name_map = parse_account_names(_bio)
+            st.session_state['account_name_map'] = acct_name_map
+            st.session_state['account_master_df'] = build_account_master_df(acct_name_map)
+        except Exception:
+            acct_name_map = {}
 
     cpa, cpb = st.columns([1,1])
     with cpa:
@@ -1632,6 +1690,15 @@ if page.startswith("1"):
     _render_downloads('### 📦 Бэлэн болсон TB файлууд', 'prepared_tb_cache', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
     _render_downloads('### 📦 Бэлэн болсон Ledger файлууд', 'prepared_ledger_cache', 'text/csv')
     _render_downloads('### 📦 Бэлэн болсон Part1 файлууд', 'prepared_part1_cache', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    acct_master_df = st.session_state.get('account_master_df', pd.DataFrame())
+    if acct_master_df is not None and not acct_master_df.empty:
+        st.markdown('### 🧾 Дансны мастер лавлах')
+        cma, cmb = st.columns([1,2])
+        cma.metric('Танигдах дансны код', f"{len(acct_master_df):,}")
+        cmb.caption('Гүйлгээний код дотор энэ жагсаалтын код агуулагдаж байвал систем урт prefix-ээр нь танина.')
+        st.dataframe(acct_master_df.head(200), use_container_width=True, hide_index=True)
+        _show_dataframe_download(acct_master_df[['account_code','account_name']], 'account_master.csv', label='📥 Дансны мастер CSV татах')
+
 
 elif page.startswith("2"):
     st.header("2️⃣ Гүйлгээ балансын шинжилгээ")
@@ -1705,34 +1772,129 @@ elif page.startswith("2"):
     if st.session_state.get('tb_error'):
         st.error(st.session_state['tb_error'])
 
+
     if st.session_state.get('tb_analysis_done', False):
         tb_stats = st.session_state.get('tb_stats', {})
+        ml_df = st.session_state.get('tb_ml_df', pd.DataFrame())
         rm_all = st.session_state.get('rm_all', pd.DataFrame())
         mo_all = st.session_state.get('mo_all', pd.DataFrame())
-        ml_df = st.session_state.get('tb_ml_df', pd.DataFrame())
         fi = st.session_state.get('tb_feature_importance', pd.DataFrame())
+        tb_all_state = st.session_state.get('tb_all', pd.DataFrame())
 
-        if tb_stats:
-            rows = [{'Он': yr, 'Данс': vals.get('accounts', 0), 'Дебит эргэлт': vals.get('turnover_d', 0), 'Кредит эргэлт': vals.get('turnover_c', 0)} for yr, vals in sorted(tb_stats.items())]
-            st.markdown('### 📊 TB summary')
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-        if not ml_df.empty:
-            st.markdown('### 🤖 TB аномали шинжилгээ')
-            show_cols = [c for c in ['year','account_code','account_name','iso_anomaly','zscore_anomaly','turn_anomaly','ensemble_anomaly'] if c in ml_df.columns]
-            st.dataframe(ml_df.sort_values(['ensemble_anomaly','year'], ascending=[False, True])[show_cols].head(500), use_container_width=True, hide_index=True)
-            _show_dataframe_download(ml_df, 'tb_anomaly_results.csv')
-        if not fi.empty:
+        available_years = []
+        if tb_all_state is not None and not tb_all_state.empty and 'year' in tb_all_state.columns:
+            available_years = sorted(pd.Series(tb_all_state['year']).dropna().astype(int).unique().tolist())
+        selected_year = st.selectbox('📅 TB тайлант он сонгох', ['Бүгд'] + [str(y) for y in available_years], key='tb_year_select_final')
+
+        ml_view = ml_df.copy()
+        rm_view = rm_all.copy()
+        mo_view = mo_all.copy()
+        if selected_year != 'Бүгд':
+            if not ml_view.empty and 'year' in ml_view.columns:
+                ml_view = ml_view[ml_view['year'].astype(str) == selected_year]
+            if not rm_view.empty and 'year' in rm_view.columns:
+                rm_view = rm_view[rm_view['year'].astype(str) == selected_year]
+            if not mo_view.empty and 'year' in mo_view.columns:
+                mo_view = mo_view[mo_view['year'].astype(str) == selected_year]
+
+        tab_tb1, tab_tb2, tab_tb3, tab_tb4 = st.tabs(['🤖 TB аномали', '🔎 TB XAI / Feature importance', '📋 Part1 эрсдэлийн матриц', '📈 Сарын хандлага'])
+
+        with tab_tb1:
+            try:
+                td.show_anomaly_description()
+            except Exception:
+                st.markdown('### 🤖 TB аномали шинжилгээ')
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric('Шинжилсэн данс', f"{len(ml_view):,}")
+            c2.metric('Хэвийн бус данс', f"{int(ml_view['ensemble_anomaly'].sum()) if 'ensemble_anomaly' in ml_view.columns else 0:,}")
+            c3.metric('Isolation Forest', f"{int(ml_view['iso_anomaly'].sum()) if 'iso_anomaly' in ml_view.columns else 0:,}")
+            c4.metric('Z-score / Turn ratio', f"{int(ml_view['zscore_anomaly'].sum()) if 'zscore_anomaly' in ml_view.columns else 0:,} / {int(ml_view['turn_anomaly'].sum()) if 'turn_anomaly' in ml_view.columns else 0:,}")
+
+            if not ml_view.empty:
+                if {'log_turn_d','log_abs_change','ensemble_anomaly'}.issubset(ml_view.columns):
+                    scatter_df = ml_view.copy()
+                    scatter_df['Төлөв'] = scatter_df['ensemble_anomaly'].map({0:'Хэвийн',1:'Аномали'}).fillna('Хэвийн')
+                    fig_sc = px.scatter(
+                        scatter_df,
+                        x='log_turn_d', y='log_abs_change',
+                        color='Төлөв',
+                        hover_data=[c for c in ['account_code','account_name','year','turn_ratio'] if c in scatter_df.columns],
+                        color_discrete_map={'Хэвийн':'#90caf9', 'Аномали':'#c62828'},
+                        opacity=0.65,
+                        title='TB аномалийн тархалт'
+                    )
+                    st.plotly_chart(fig_sc, use_container_width=True)
+                show_cols = [c for c in ['year','account_code','account_name','iso_anomaly','zscore_anomaly','turn_anomaly','ensemble_anomaly'] if c in ml_view.columns]
+                st.dataframe(ml_view.sort_values(['ensemble_anomaly','year'], ascending=[False, True])[show_cols].head(1000), use_container_width=True, hide_index=True)
+                _show_dataframe_download(ml_view, f'tb_anomaly_results_{selected_year}.csv')
+                try:
+                    td.show_anomaly_interpretation(
+                        n_if=int(ml_view['iso_anomaly'].sum()) if 'iso_anomaly' in ml_view.columns else 0,
+                        n_zscore=int(ml_view['zscore_anomaly'].sum()) if 'zscore_anomaly' in ml_view.columns else 0,
+                        n_turn=int(ml_view['turn_anomaly'].sum()) if 'turn_anomaly' in ml_view.columns else 0,
+                        n_ensemble=int(ml_view['ensemble_anomaly'].sum()) if 'ensemble_anomaly' in ml_view.columns else 0,
+                    )
+                except Exception:
+                    pass
+
+        with tab_tb2:
             st.markdown('### 🔎 TB XAI / Feature importance')
-            st.dataframe(fi, use_container_width=True, hide_index=True)
-        if not rm_all.empty:
+            st.caption('Дансны аномалид хамгийн их нөлөөлсөн шинж чанаруудыг доорх график харуулна.')
+            if not fi.empty:
+                st.dataframe(fi, use_container_width=True, hide_index=True)
+                fig_fi = px.bar(
+                    fi.head(15),
+                    x='importance', y='feature',
+                    orientation='h',
+                    color='importance',
+                    color_continuous_scale='Blues',
+                    title='Шинж чанарын ач холбогдол'
+                )
+                fig_fi.update_layout(height=450, yaxis={'categoryorder': 'total ascending'})
+                st.plotly_chart(fig_fi, use_container_width=True)
+            else:
+                st.info('Feature importance одоогоор бэлэн болоогүй байна.')
+
+        with tab_tb3:
             st.markdown('### 📋 Part1 эрсдэлийн матриц')
-            st.dataframe(rm_all.head(300), use_container_width=True, hide_index=True)
-        if not mo_all.empty and 'month' in mo_all.columns and 'total_debit_mnt' in mo_all.columns:
+            st.caption('Данс × харилцагч × сар түвшинд их дүн, өндөр давтамжийн эрсдэлийг нэгтгэн харуулна.')
+            if not rm_view.empty:
+                c1, c2, c3 = st.columns(3)
+                c1.metric('Нийт хос', f"{len(rm_view):,}")
+                c2.metric('Эрсдэлтэй хос', f"{len(rm_view[rm_view['risk_score']>0]) if 'risk_score' in rm_view.columns else 0:,}")
+                c3.metric('Өндөр эрсдэл', f"{len(rm_view[rm_view['risk_level'].astype(str).str.contains('Өндөр', na=False)]) if 'risk_level' in rm_view.columns else 0:,}")
+                top_rm = rm_view.copy()
+                if 'risk_score' in top_rm.columns:
+                    top_rm = top_rm.sort_values(['risk_score','transaction_count'], ascending=[False, False])
+                st.dataframe(top_rm.head(500), use_container_width=True, hide_index=True)
+                if {'counterparty_name','transaction_count'}.issubset(top_rm.columns):
+                    top_cp = top_rm.groupby('counterparty_name', dropna=False)['transaction_count'].sum().sort_values(ascending=False).head(20).reset_index()
+                    top_cp.columns = ['Харилцагч', 'Гүйлгээний тоо']
+                    fig_cp = px.bar(top_cp, x='Гүйлгээний тоо', y='Харилцагч', orientation='h', title='Эрсдэл өндөртэй 20 харилцагч')
+                    fig_cp.update_layout(height=500, yaxis={'categoryorder':'total ascending'})
+                    st.plotly_chart(fig_cp, use_container_width=True)
+                _show_dataframe_download(top_rm, f'part1_risk_matrix_{selected_year}.csv')
+            else:
+                st.info('Part1 эрсдэлийн матриц олдсонгүй.')
+
+        with tab_tb4:
             st.markdown('### 📈 Сарын хандлага')
-            mo_plot = mo_all.copy()
-            mo_plot['total_debit_mnt'] = pd.to_numeric(mo_plot['total_debit_mnt'], errors='coerce').fillna(0)
-            fig_mo = px.line(mo_plot, x='month', y='total_debit_mnt', color='year' if 'year' in mo_plot.columns else None, title='Сарын дебит хөдөлгөөн')
-            st.plotly_chart(fig_mo, use_container_width=True)
+            st.caption('Сарын дебит хөдөлгөөн болон гүйлгээний тоогоор улирлын болон онцгой хэлбэлзлийг шалгана.')
+            if not mo_view.empty and 'month' in mo_view.columns:
+                metric_col = 'total_debit_mnt' if 'total_debit_mnt' in mo_view.columns else mo_view.columns[0]
+                metric_label = st.selectbox('Үзүүлэх үзүүлэлт', [c for c in ['total_debit_mnt','total_credit_mnt','transaction_count','ending_balance_mnt'] if c in mo_view.columns], key='tb_mo_metric')
+                mo_plot = mo_view.copy()
+                mo_plot[metric_label] = pd.to_numeric(mo_plot[metric_label], errors='coerce').fillna(0)
+                color_col = 'account_code' if 'account_code' in mo_plot.columns else None
+                fig_mo = px.line(mo_plot.sort_values('month'), x='month', y=metric_label, color=color_col, title='Сарын хандлагын шинжилгээ')
+                st.plotly_chart(fig_mo, use_container_width=True)
+                agg = mo_plot.groupby('month')[metric_label].sum().reset_index()
+                fig_bar = px.bar(agg, x='month', y=metric_label, title='Сарын нийлбэр хөдөлгөөн')
+                st.plotly_chart(fig_bar, use_container_width=True)
+                st.dataframe(mo_plot.head(500), use_container_width=True, hide_index=True)
+                _show_dataframe_download(mo_plot, f'monthly_trend_{selected_year}.csv')
+            else:
+                st.info('Сарын хандлагын мэдээлэл олдсонгүй.')
     else:
         st.info('👆 Энд шууд файл оруулах эсвэл 1️⃣ цэсэнд бэлтгэсэн TB/Part1 файлаа ашиглаад шинжилгээг эхлүүлнэ үү.')
 
@@ -1782,12 +1944,14 @@ elif page.startswith("3"):
                     f.seek(0)
                     led_df = read_ledger(f)
                     if not led_df.empty:
+                        led_df = merge_account_names(led_df, st.session_state.get('account_name_map', {}))
                         frames.append(led_df)
                         ledger_stats_j[Path(f.name).name] = {'rows': len(led_df), 'accounts': led_df.get('account_code', pd.Series(dtype=str)).astype(str).nunique()}
                 elif typ == 'edt':
                     f.seek(0)
                     edt_df, cnt = process_edt(f, year)
                     if cnt > 0 and not edt_df.empty:
+                        edt_df = merge_account_names(edt_df, st.session_state.get('account_name_map', {}))
                         frames.append(edt_df)
                         ledger_stats_j[Path(f.name).name] = {'rows': len(edt_df), 'accounts': edt_df.get('account_code', pd.Series(dtype=str)).astype(str).nunique()}
             if not frames:
@@ -1812,6 +1976,7 @@ elif page.startswith("3"):
             st.session_state['journal_error'] = str(e)
             st.exception(e)
 
+
     if st.session_state.get('journal_error'):
         st.error(st.session_state['journal_error'])
 
@@ -1821,29 +1986,91 @@ elif page.startswith("3"):
         xai_importance_j = st.session_state.get('journal_xai', pd.DataFrame())
         ledger_stats_j = st.session_state.get('journal_ledger_stats', {})
 
-        if ledger_stats_j:
-            st.markdown('### 📊 Journal summary')
-            st.dataframe(pd.DataFrame([{'Файл': k, 'Мөр': v.get('rows', 0), 'Данс': v.get('accounts', 0)} for k, v in ledger_stats_j.items()]), use_container_width=True, hide_index=True)
-        if not model_summary_j.empty:
-            st.markdown('### 🤖 Алгоритмын тойм')
-            st.dataframe(model_summary_j, use_container_width=True, hide_index=True)
-        if not ml_show_j.empty:
+        tab_j1, tab_j2, tab_j3, tab_j4 = st.tabs(['📊 Dashboard', '🔍 Өндөр эрсдэлтэй гүйлгээ', '👤 Харилцагч / Данс', '🧠 XAI / Model'])
+
+        with tab_j1:
+            st.markdown('### 📊 Ерөнхий журналын дашбоард')
+            if ledger_stats_j:
+                st.dataframe(pd.DataFrame([{'Файл': k, 'Мөр': v.get('rows', 0), 'Данс': v.get('accounts', 0)} for k, v in ledger_stats_j.items()]), use_container_width=True, hide_index=True)
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric('Шинжилсэн гүйлгээ', f"{len(ml_show_j):,}")
+            c2.metric('ML саналын дундаж', f"{ml_show_j['ml_vote_count'].mean():.2f}" if 'ml_vote_count' in ml_show_j.columns and len(ml_show_j) else '0')
+            c3.metric('Маш өндөр эрсдэл', f"{int((ml_show_j['ml_risk_level'].astype(str)=='🔴 Маш өндөр').sum()) if 'ml_risk_level' in ml_show_j.columns else 0:,}")
+            c4.metric('Танигдсан дансны нэртэй', f"{int(ml_show_j['account_name'].fillna('').astype(str).str.len().gt(0).sum()) if 'account_name' in ml_show_j.columns else 0:,}")
+            if not ml_show_j.empty and 'ml_risk_level' in ml_show_j.columns:
+                risk_order = ['🟢 Бага','🟡 Дунд','🟠 Өндөр','🔴 Маш өндөр']
+                rl = ml_show_j['ml_risk_level'].value_counts().reindex(risk_order).fillna(0).reset_index()
+                rl.columns = ['Эрсдэлийн түвшин','Гүйлгээний тоо']
+                fig_rl = px.bar(rl, x='Эрсдэлийн түвшин', y='Гүйлгээний тоо', color='Эрсдэлийн түвшин',
+                                color_discrete_map={'🟢 Бага':'#4CAF50','🟡 Дунд':'#FFC107','🟠 Өндөр':'#FF9800','🔴 Маш өндөр':'#F44336'},
+                                title='Ерөнхий журналын эрсдэлийн түвшний тархалт')
+                fig_rl.update_layout(showlegend=False, height=350)
+                st.plotly_chart(fig_rl, use_container_width=True)
+            if not ml_show_j.empty and {'transaction_date','amount'}.issubset(ml_show_j.columns):
+                trend = ml_show_j.copy()
+                trend['month_key'] = trend['transaction_date'].astype(str).str[:7]
+                trend = trend.groupby('month_key').agg(total_amount=('amount','sum'), txn=('amount','count')).reset_index()
+                fig_tr = make_subplots(rows=2, cols=1, subplot_titles=('Сарын нийт дүн', 'Сарын эрсдэлтэй гүйлгээний тоо'))
+                fig_tr.add_trace(go.Scatter(x=trend['month_key'], y=trend['total_amount'], name='Дүн'), row=1, col=1)
+                fig_tr.add_trace(go.Bar(x=trend['month_key'], y=trend['txn'], name='Гүйлгээ'), row=2, col=1)
+                fig_tr.update_layout(height=500)
+                st.plotly_chart(fig_tr, use_container_width=True)
+
+        with tab_j2:
             st.markdown('### 🔍 Өндөр эрсдэлтэй journal гүйлгээ')
-            show_cols = [c for c in ['transaction_date','account_code','account_name','counterparty_name','amount','ml_vote_count','ml_risk_level','xai_top_feature','transaction_description'] if c in ml_show_j.columns]
-            sort_col = 'ml_vote_count' if 'ml_vote_count' in ml_show_j.columns else show_cols[0]
-            st.dataframe(ml_show_j.sort_values(sort_col, ascending=False)[show_cols].head(1000), use_container_width=True, hide_index=True)
-            _show_dataframe_download(ml_show_j, 'journal_ml_results.csv')
-        if not xai_importance_j.empty:
-            st.markdown('### 🧠 XAI / Feature importance')
-            st.dataframe(xai_importance_j, use_container_width=True, hide_index=True)
-            fig_fi = px.bar(xai_importance_j.head(15), x='importance', y='feature', orientation='h', title='Top XAI features')
-            st.plotly_chart(fig_fi, use_container_width=True)
+            if not ml_show_j.empty:
+                show_cols = [c for c in ['transaction_date','account_code','account_name','counterparty_name','amount','ml_vote_count','ml_risk_level','xai_top_feature','transaction_description'] if c in ml_show_j.columns]
+                sort_col = 'ml_vote_count' if 'ml_vote_count' in ml_show_j.columns else show_cols[0]
+                st.dataframe(ml_show_j.sort_values(sort_col, ascending=False)[show_cols].head(1000), use_container_width=True, hide_index=True)
+                _show_dataframe_download(ml_show_j, 'journal_ml_results.csv')
+            else:
+                st.info('Journal гүйлгээний үр дүн хоосон байна.')
+
+        with tab_j3:
+            st.markdown('### 👤 Харилцагч / Дансны төвлөрлийн шинжилгээ')
+            if not ml_show_j.empty and 'counterparty_name' in ml_show_j.columns:
+                cp = ml_show_j[ml_show_j['counterparty_name'].fillna('').astype(str).str.len() > 0].groupby('counterparty_name').agg(
+                    total=('amount','count'),
+                    high_risk=('ml_vote_count', lambda s: (pd.to_numeric(s, errors='coerce').fillna(0) >= 2).sum()),
+                    amount=('amount','sum'),
+                    accounts=('account_code','nunique')
+                ).reset_index().sort_values(['high_risk','amount'], ascending=[False, False]).head(30)
+                if not cp.empty:
+                    cp.columns = ['Харилцагч','Нийт гүйлгээ','Өндөр эрсдэл','Нийт дүн','Дансны тоо']
+                    st.dataframe(cp, use_container_width=True, hide_index=True)
+                    fig_cp = px.bar(cp.head(20), x='Өндөр эрсдэл', y='Харилцагч', orientation='h', color='Дансны тоо', title='Эрсдэл өндөртэй харилцагчид')
+                    fig_cp.update_layout(height=500, yaxis={'categoryorder':'total ascending'})
+                    st.plotly_chart(fig_cp, use_container_width=True)
+            if not ml_show_j.empty and 'account_code' in ml_show_j.columns:
+                acct = ml_show_j.groupby(['account_code','account_name'], dropna=False).agg(
+                    total=('amount','count'),
+                    high_risk=('ml_vote_count', lambda s: (pd.to_numeric(s, errors='coerce').fillna(0) >= 2).sum()),
+                    amount=('amount','sum')
+                ).reset_index().sort_values(['high_risk','amount'], ascending=[False, False]).head(30)
+                acct.columns = ['Дансны код','Дансны нэр','Нийт гүйлгээ','Өндөр эрсдэл','Нийт дүн']
+                st.dataframe(acct, use_container_width=True, hide_index=True)
+
+        with tab_j4:
+            st.markdown('### 🧠 XAI / Model summary')
+            if not model_summary_j.empty:
+                st.dataframe(model_summary_j, use_container_width=True, hide_index=True)
+            if not xai_importance_j.empty:
+                st.dataframe(xai_importance_j, use_container_width=True, hide_index=True)
+                fig_fi = px.bar(xai_importance_j.head(15), x='importance', y='feature', orientation='h', title='Top XAI features')
+                fig_fi.update_layout(height=450, yaxis={'categoryorder':'total ascending'})
+                st.plotly_chart(fig_fi, use_container_width=True)
+            else:
+                st.info('XAI / feature importance мэдээлэл олдсонгүй.')
     else:
         st.info('👆 1️⃣ цэсэнд бэлтгэсэн ledger/ЕЖ файлаа ашиглах эсвэл энд шууд оруулж шинжилгээг эхлүүлнэ үү.')
 
+
 else:
     st.header("4️⃣ Материаллаг байдлын тооцоо")
-    st.markdown("TB файл дээр суурилсан материаллаг байдлын хуваарилалт.")
+    st.markdown("""
+    Энэ хэсэг нь TB өгөгдөл дээр суурилан данс бүрт нийт материаллаг байдлыг хуваарилна.
+    Хаалтын үлдэгдэл өндөр, эсвэл эргэлт өндөр дансанд илүү их зөвшөөрөгдөх алдааны босго онооно.
+    """)
 
     mat_files = st.file_uploader("📎 Нэмэлт TB файл оруулах", type=['xlsx'], accept_multiple_files=True, key='mat_files_work')
     tb_inputs = _cache_files('prepared_tb_cache')
@@ -1858,16 +2085,55 @@ else:
                 bio = io.BytesIO(buf.getvalue()); bio.name = f'TB_standardized_{year}_{Path(f.name).stem}.xlsx'
                 tb_inputs.append(bio)
 
+    base_choice = st.selectbox('Материаллаг байдлын суурь', ['Хаалтын үлдэгдэл', 'Эргэлтийн нийлбэр'], key='mat_base_choice')
     total_mat = st.number_input('Нийт материаллаг байдлын дүн', min_value=0.0, value=1000000.0, step=100000.0)
+    perf_ratio = st.slider('Гүйцэтгэлийн материаллаг байдлын хувь', 0.30, 1.00, 0.75, 0.05, key='perf_ratio')
     if st.button('📐 Материаллаг байдлыг тооцоолох', type='primary', use_container_width=True):
         tb_all, _ = load_tb(tb_inputs) if tb_inputs else (pd.DataFrame(), {})
         if tb_all.empty:
             st.warning('TB өгөгдөл олдсонгүй.')
         else:
             d = tb_all.copy()
-            base_amt = d['closing_debit'].abs() + d['closing_credit'].abs() if 'closing_debit' in d.columns else d['turnover_debit'].abs() + d['turnover_credit'].abs()
-            total_base = base_amt.sum()
-            d['materiality_alloc'] = np.where(total_base > 0, total_mat * base_amt / total_base, 0)
-            show_cols = [c for c in ['year','account_code','account_name','closing_debit','closing_credit','turnover_debit','turnover_credit','materiality_alloc'] if c in d.columns]
-            st.dataframe(d[show_cols].sort_values('materiality_alloc', ascending=False), use_container_width=True, hide_index=True)
-            _show_dataframe_download(d[show_cols], 'materiality_by_account.csv')
+            if base_choice == 'Хаалтын үлдэгдэл':
+                base_amt = d.get('closing_debit', 0).abs() + d.get('closing_credit', 0).abs()
+                d['Суурь'] = 'Хаалтын үлдэгдэл'
+            else:
+                base_amt = d.get('turnover_debit', 0).abs() + d.get('turnover_credit', 0).abs()
+                d['Суурь'] = 'Эргэлтийн нийлбэр'
+            total_base = pd.to_numeric(base_amt, errors='coerce').fillna(0).sum()
+            d['materiality_alloc'] = np.where(total_base > 0, total_mat * pd.to_numeric(base_amt, errors='coerce').fillna(0) / total_base, 0)
+            d['performance_materiality'] = d['materiality_alloc'] * perf_ratio
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric('Нийт материаллаг байдал', f"₮{total_mat:,.0f}")
+            c2.metric('Гүйцэтгэлийн материаллаг байдал', f"₮{total_mat * perf_ratio:,.0f}")
+            c3.metric('Хуваарилсан данс', f"{len(d):,}")
+
+            show_cols = [c for c in ['year','account_code','account_name','closing_debit','closing_credit','turnover_debit','turnover_credit','materiality_alloc','performance_materiality'] if c in d.columns]
+            d_show = d[show_cols].sort_values('materiality_alloc', ascending=False)
+            st.dataframe(d_show, use_container_width=True, hide_index=True)
+
+            fig = px.bar(
+                d_show.head(20),
+                x='account_code',
+                y='materiality_alloc',
+                hover_data=[c for c in ['account_name','year','performance_materiality'] if c in d_show.columns],
+                title='Материаллаг байдлын хуваарилалт — өндөр ач холбогдолтой 20 данс'
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+            by_year = d_show.groupby('year', dropna=False)['materiality_alloc'].sum().reset_index() if 'year' in d_show.columns else pd.DataFrame()
+            if not by_year.empty:
+                fig2 = px.pie(by_year, values='materiality_alloc', names='year', title='Материаллаг байдлын онуудаарх бүтэц')
+                st.plotly_chart(fig2, use_container_width=True)
+
+            out = io.BytesIO()
+            with pd.ExcelWriter(out, engine='openpyxl') as w:
+                d_show.to_excel(w, sheet_name='Материаллаг_байдал', index=False)
+            out.seek(0)
+            st.download_button(
+                "📥 Материаллаг байдлын тооцоо татах",
+                data=out.getvalue(),
+                file_name='materiality_by_account.xlsx',
+                mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            )
